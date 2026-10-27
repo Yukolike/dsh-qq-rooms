@@ -44,6 +44,7 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 | 事件令牌 | 空 | 可空 |
 | 房间工作区 | 空 | 新房间的 cwd；空 = `~/.dsh/qq-rooms` |
 | 模型 | `deepseek-account/deepseek-flash` | `provider/model` |
+| 访客工具 | `none` | 访客房间的工具：`none` / `safe` / `standard` |
 | 只发 [QQ] 块 | 关 | 开 = 只发正文里 `[QQ]…[/QQ]` 中间那段 |
 
 配置文件在 `~/.dsh/qq-rooms-config.json`，状态在 `~/.dsh/qq-rooms-state.json`。
@@ -83,9 +84,10 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 
 ## 安全
 
-- **访客房间目前没有工具隔离**：拿到许可的人，其房间拥有当前 profile 的全部工具。不要把 `接待陌生人` 用在不可信场景，或先给访客单独准备一个干净 profile。
+- **访客房间默认零工具**：建房后调用 `agent.ctx.tools.restrict({ allow: [] })`，模型请求头里的 `tools` 为 0，只能打字。主人私聊与群不受影响。
+- `访客工具` 可设 `none`（默认，全禁）/ `safe`（只留 `todo_write`）/ `standard`（不限制，不推荐）。
+- 这是 **agent 级运行时掩码**，不是 profile 隔离；`房间工作区` 仍建议指向空目录。
 - 默认总开关关、试运行开，装完不会立刻发消息。
-- 建议把 `房间工作区` 指到一个空目录。
 
 ## 开发
 

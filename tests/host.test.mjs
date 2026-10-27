@@ -39,6 +39,7 @@ function 环境(配置 = {}) {
   }
 
   const 跟进 = []
+  const 限制 = []
   const 事件handler = []
   const 效果 = []
   const 定时 = []
@@ -51,8 +52,10 @@ function 环境(配置 = {}) {
     return 已知.get(s) || 已知.get(s.replace(/^session-/u, '')) || 已知.get('session-' + s)
   }
   const 造 = (sessionId) => ({
+    id: sessionId,
     session: { id: sessionId, append: async () => {} },
     followup: async (m) => { 跟进.push(m) },
+    ctx: { tools: { restrict: (f) => { 限制.push(f); return () => {} } } },
   })
 
   const ctx = {
@@ -81,7 +84,7 @@ function 环境(配置 = {}) {
   }
 
   return {
-    家, 请求, 跟进, 事件handler, 效果, 定时, 路由, ctx,
+    家, 请求, 跟进, 限制, 事件handler, 效果, 定时, 路由, ctx,
     配置: () => JSON.parse(readFileSync(join(家, 'qq-rooms-config.json'), 'utf8')),
     清理: () => { globalThis.fetch = 原fetch },
   }
@@ -426,5 +429,21 @@ test('正文里的相对路径图按房间工作区解析并真的发出去', as
     const 文本 = e.请求.filter((r) => r.u.endsWith('/send_private_msg') && r.body.message && r.body.message[0] && r.body.message[0].type === 'text')
     assert.equal(文本.length, 1)
     assert.doesNotMatch(文本[0].body.message[0].data.text, /!\[/u, 'markdown 不能泄漏到 QQ')
+  } finally { e.清理() }
+})
+
+test('访客房间自动锁工具；主人私聊不锁', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.equal(e.限制.length, 1, '访客房间应调用一次 restrict')
+    assert.deepEqual(e.限制[0], { allow: [] }, '默认 none：全部掩掉')
+    const 前 = e.限制.length
+    await api.处理消息(消息({ user_id: 10000, message_id: 2 }))
+    await 等一拍()
+    assert.equal(e.限制.length, 前, '主人私聊不锁工具')
   } finally { e.清理() }
 })

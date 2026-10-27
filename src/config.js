@@ -33,6 +33,7 @@ export const 默认配置 = Object.freeze({
   // ── 房间 ────────────────────────────────────────────────
   房间工作区: '',                 // 访客/新房间的 cwd；空 = ~/.dsh/qq-rooms
   模型: 'deepseek-account/deepseek-flash',
+  访客工具: 'none',                // 访客房间的工具：none = 全禁；safe = 只留 todo；standard = 不限制
   访客: {},                       // 白名单：'QQ号' -> { 昵称, 准到 }  准到 = 0 表示长期
   黑名单: {},                     // 黑名单：'QQ号' -> { 拒绝于 }  这些人再来直接静默丢弃，不再问主人
   群: {},                         // '群号' -> { enabled, mode, addedAt, muteUntil, members }
@@ -160,6 +161,7 @@ export function 归一化(raw) {
 
     房间工作区: 字(混.房间工作区),
     模型: 字(混.模型) || 默认配置.模型,
+    访客工具: ['none', 'safe', 'standard'].includes(字(混.访客工具)) ? 字(混.访客工具) : 默认配置.访客工具,
     访客: 规整访客(混.访客),
     黑名单: 规整黑名单(混.黑名单),
     群: 规整群(混.群),

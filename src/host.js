@@ -355,7 +355,34 @@ export function apply(ctx) {
 
   /* ---------------- 入站 ---------------- */
 
-  const 昵称 = (条) => String((条.sender && (条.sender.card || 条.sender.nickname)) || '')
+  /** 已锁工具的 agent id（避免重复 restrict 叠加）。 */
+  const 已限工具 = new Set()
+
+  /**
+   * 访客房间的工具闸门。DSH 没有“工具白名单”，但 `agent.ctx.tools.restrict({ allow })`
+   * 是 agent 级别的允许/拒绝掩码，必须在 agent scope 上调（宿主 ctx 会报错）。
+   * 实测：allow: [] 之后，模型请求头里的 tools = 0，聊天仍正常。
+   */
+  function 限制访客工具(agent, 策略) {
+    if (!agent || 策略 === 'standard') return
+    const id = agent.id || (agent.session && agent.session.id)
+    if (!id || 已限工具.has(id)) return
+    try {
+      const 器 = agent.ctx && agent.ctx.tools
+      if (!器 || typeof 器.restrict !== 'function') {
+        记账('访客工具限制：宿主没有 tools.restrict')
+        return
+      }
+      const 过滤 = 策略 === 'safe' ? { allow: ['todo_write'] } : { allow: [] }
+      器.restrict(过滤)
+      已限工具.add(id)
+      记账(`访客房间工具已限制（${策略}）：${id}`)
+    } catch (error) {
+      记账('访客工具限制失败：' + String((error && error.message) || error))
+    }
+  }
+
+  const 昵称 = (条) => String((条.sender && (条.sender.card ||条.sender.nickname)) || '')
 
   /** 新房间的人格设定：从房间工作区的 AGENTS.md 读（agents.create 不会自动注入）。 */
   function 读人格(配置) {
@@ -370,6 +397,8 @@ export function apply(ctx) {
 
   async function 转入(配置, { 键, 类型, 号码, 发送者, 文字, 图们, 条 }) {
     const 房 = await 房间.确保(键, { 昵称: 昵称(条) })
+    const 拆 = 拆聊天键(键)
+    if (拆 && 拆.类型 === '私聊' && 拆.号码 !== String(配置.主人)) 限制访客工具(房.agent, 配置.访客工具)
 
     const 收下 = await 收图(配置, 图们, 条.message_id)
     const 署名 = 类型 === '群'

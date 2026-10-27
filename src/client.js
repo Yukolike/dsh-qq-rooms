@@ -253,6 +253,17 @@ window.__ModuleLoader__.load({
           h('div', { style: S.h }, '房间'),
           行('模型', 'provider/model', 输入(配置.模型, (v) => 改('模型', v), 'deepseek-account/deepseek-flash')),
           行('房间工作区', '留空 = ~/.dsh/qq-rooms；建议指到一个空目录', 输入(配置.房间工作区, (v) => 改('房间工作区', v), '可空')),
+          行(
+            '访客工具',
+            'none = 全禁（默认）；safe = 只留 todo；standard = 不限制',
+            h(
+              'select',
+              { style: { ...S.small, width: 170 }, value: 配置.访客工具 || 'none', onChange: (e) => 改('访客工具', e.target.value) },
+              h('option', { value: 'none' }, '全禁（推荐）'),
+              h('option', { value: 'safe' }, '只留 todo'),
+              h('option', { value: 'standard' }, '不限制'),
+            ),
+          ),
           行('只发 [QQ] 块', '开 = 只发正文里 [QQ]…[/QQ] 中间那段', 开关(配置.只发标记内, (v) => 改('只发标记内', v), '只发标记内')),
           行('只回 QQ 唤醒的那一轮', '你在 DSH 里自己聊的不推到手机', 开关(配置.只回QQ唤醒, (v) => 改('只回QQ唤醒', v), '只回QQ唤醒')),
         ),
