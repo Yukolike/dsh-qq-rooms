@@ -3,8 +3,14 @@
 // 只做四件事：调 HTTP、拉历史、发消息、把消息段翻译成文字。
 // 不认识房间、不认识指令、不写配置 —— 那些在 host / policy / rooms。
 //
-// 其中若干纯函数移植自 dsh-qq-bridge（MIT, Copyright (c) 2026 Yuuyuko-uu），
-// 为保持与原版行为一致（尤其是标记剥离、卡片抽取、正文图）保留原实现语义。
+// ── 来源 ────────────────────────────────────────────────────────────
+// 以下函数移植 / 改写自 dsh-qq-bridge
+// (https://github.com/Yuuyuko-uu/dsh-qq-bridge, MIT, Copyright (c) 2026 Yuuyuko-uu)：
+//   提取正文、提取图块、私人消息体、群消息体、图片段、按段拆、
+//   抠正文图、抠QQ标记、看图类、卡片文字、取图字节、转发文字
+// 为保持与原版行为一致（标记剥离、卡片抽取、正文图、转发展开），保留原实现语义。
+// 其余（OneBot 客户端、超时、发送、语音转写接线）为本项目实现。
+// 完整许可与原版权声明见仓库根目录 LICENSE。
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'

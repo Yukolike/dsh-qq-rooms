@@ -1,8 +1,11 @@
 # dsh-qq-rooms
 
-> **派生说明**：本项目是基于 [dsh-qq-bridge](https://github.com/Yuuyuko-uu/dsh-qq-bridge)（MIT）的**重写**，不是它的补丁分支。
-> 传输与消息解析部分移植自原项目；房间模型、白/黑名单、群策略、装配为本项目新写。
-> 插件 id（`qq-rooms`）与配置格式均不同，**不能与原版同时启用**。
+> **来源与致谢**：本项目衍生自 [dsh-qq-bridge](https://github.com/Yuuyuko-uu/dsh-qq-bridge)
+> （作者 [Yuuyuko-uu](https://github.com/Yuuyuko-uu)，MIT）。
+> `src/transport.js` 中的消息段解析、标记剥离、卡片抽取、正文图、转发展开等函数移植自原项目并做了修改；
+> 房间模型、白/黑名单、群策略、插件装配为本项目新写。
+> 本项目是独立的第三方项目，**不是原项目的官方分支**；插件 id（`qq-rooms`）与配置格式均不同，
+> 不能与原版同时启用。原项目版权声明见 [LICENSE](./LICENSE)。
 
 DSH 的 QQ 房间插件：**聊天即房间**，不用再手动把 QQ 会话绑到 DSH 会话。
 
