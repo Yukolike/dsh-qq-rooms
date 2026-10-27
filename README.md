@@ -29,6 +29,9 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 
 装完重启一次 DSH，然后 **设置 → 通到 QQ**。
 
+> 不需要构建：仓库就是可运行源码（`main` 指向 `src/host.js`），没有依赖、没有编译步骤。
+> `dsh plugin add` 会直接 clone 并用源码运行；GitHub Release 里的 `Source code` 包就是完整安装包。
+
 > 与 `dsh-qq-bridge` 不兼容：两个都启用会双发。请只留一个。
 
 ## 配置
