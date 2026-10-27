@@ -1,0 +1,4 @@
+# DSH「通到 QQ · 房间」—— 聊天即房间，不再手动绑定会话
+- insert:
+    - id: qq-rooms
+      name: 'dsh-qq-rooms'
