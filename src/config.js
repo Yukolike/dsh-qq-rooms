@@ -21,8 +21,6 @@ export const 默认配置 = Object.freeze({
   事件地址: 'ws://127.0.0.1:3001',
   事件令牌: '',
   轮询间隔毫秒: 2000,
-  合并窗口秒: 1,
-  合并最多秒: 20,
   补投窗口分: 10,
   审批冷却分: 10,
 
@@ -33,7 +31,9 @@ export const 默认配置 = Object.freeze({
   // ── 房间 ────────────────────────────────────────────────
   房间工作区: '',                 // 访客/新房间的 cwd；空 = ~/.dsh/qq-rooms
   模型: 'deepseek-account/deepseek-flash',
-  访客工具: 'none',                // 访客房间的工具：none = 全禁；safe = 只留 todo；standard = 不限制
+  访客工具: 'none',                // 访客房间的默认工具档：none / safe / standard
+  群工具: 'none',                  // 群房间的默认工具档（群成员不可信，默认全禁）
+  房间工具: {},                    // 按房间覆盖：'私聊:号' / '群:号' -> none|safe|standard（改了立刻生效）
   访客: {},                       // 白名单：'QQ号' -> { 昵称, 准到 }  准到 = 0 表示长期
   黑名单: {},                     // 黑名单：'QQ号' -> { 拒绝于 }  这些人再来直接静默丢弃，不再问主人
   群: {},                         // '群号' -> { enabled, mode, addedAt, muteUntil, members }
@@ -56,6 +56,15 @@ export const 默认配置 = Object.freeze({
 })
 
 const 群模式 = new Set(['mention', 'all'])
+/** 访客 / 每房工具档。 */
+const 工具档 = new Set(['none', 'safe', 'standard'])
+
+/**
+ * `/save` 允许前端改的键：全部设置项，但三张「边跑边长」的表除外 ——
+ *   · 房间：由 host 在收到消息时写；前端拿的是打开页面那一刻的快照，让它写回会把期间新建的房间冲掉。
+ *   · 访客 / 黑名单：有 /approve、/unblock 两个专用口，前端回传旧快照会把刚批的审批回滚。
+ */
+export const 可保存键 = Object.keys(默认配置).filter((k) => !['房间', '访客', '黑名单'].includes(k))
 
 const 是对象 = (v) => Boolean(v) && typeof v === 'object' && !Array.isArray(v)
 const 字 = (v) => (typeof v === 'string' ? v.trim() : '')
@@ -70,6 +79,19 @@ const 数 = (v, 兜, 低, 高) => {
   return Math.max(低, Math.min(Math.round(n), 高))
 }
 const 号码 = (v) => (/^\d{4,12}$/.test(String(v || '').trim()) ? String(v).trim() : '')
+
+/** 每房工具档：键必须是 私聊:号 / 群:号，值只认三档。 */
+export function 规整房间工具(raw) {
+  const 出 = {}
+  if (!是对象(raw)) return 出
+  for (const [k, v] of Object.entries(raw)) {
+    if (!/^(私聊|群):\d{4,12}$/u.test(String(k))) continue
+    const 值 = String(v)
+    if (!工具档.has(值)) continue
+    出[String(k)] = 值
+  }
+  return 出
+}
 
 /** 访客表：只留合法 QQ 号，准到 = 0（长期）或毫秒时间戳。 */
 export function 规整访客(raw) {
@@ -99,7 +121,7 @@ export function 规整黑名单(raw) {
   return 出
 }
 
-/** 群表：enabled / mode / 静音截止 / 成员名单。 */
+/** 群表：名称 / enabled / mode / 静音截止 / 成员名单。 */
 export function 规整群(raw) {
   const 出 = {}
   if (!是对象(raw)) return 出
@@ -110,6 +132,7 @@ export function 规整群(raw) {
     const 名单 = 是对象(v && v.members) ? v.members : {}
     const 洗名单 = (x) => (Array.isArray(x) ? [...new Set(x.map(号码).filter(Boolean))] : [])
     出[群号] = {
+      名称: 字(v && v.名称).slice(0, 24),
       enabled: 布(v && v.enabled, true),
       mode: 模式,
       addedAt: Number((v && v.addedAt) || 0),
@@ -120,7 +143,7 @@ export function 规整群(raw) {
   return 出
 }
 
-/** 房间表：键必须是 私聊:号 / 群:号，值只留 sessionId 与时间。 */
+/** 房间表：键必须是 私聊:号 / 群:号，值只留 sessionId、昵称与时间。 */
 export function 规整房间(raw) {
   const 出 = {}
   if (!是对象(raw)) return 出
@@ -130,6 +153,7 @@ export function 规整房间(raw) {
     if (!/^session-[A-Za-z0-9-]{8,}$/u.test(sessionId)) continue
     出[String(k)] = {
       sessionId,
+      昵称: 字(v && v.昵称).slice(0, 24),
       createdAt: Number((v && v.createdAt) || 0),
       lastAt: Number((v && v.lastAt) || 0),
       personaHash: 字(v && v.personaHash).slice(0, 32),
@@ -151,8 +175,6 @@ export function 归一化(raw) {
     事件地址: 混.事件地址 === undefined ? 默认配置.事件地址 : 字(混.事件地址),
     事件令牌: 字(混.事件令牌),
     轮询间隔毫秒: 数(混.轮询间隔毫秒, 默认配置.轮询间隔毫秒, 500, 60_000),
-    合并窗口秒: 数(混.合并窗口秒, 默认配置.合并窗口秒, 0, 10),
-    合并最多秒: 数(混.合并最多秒, 默认配置.合并最多秒, 5, 120),
     补投窗口分: 数(混.补投窗口分, 默认配置.补投窗口分, 0, 1440),
     审批冷却分: 数(混.审批冷却分, 默认配置.审批冷却分, 1, 1440),
 
@@ -161,7 +183,9 @@ export function 归一化(raw) {
 
     房间工作区: 字(混.房间工作区),
     模型: 字(混.模型) || 默认配置.模型,
-    访客工具: ['none', 'safe', 'standard'].includes(字(混.访客工具)) ? 字(混.访客工具) : 默认配置.访客工具,
+    访客工具: 工具档.has(字(混.访客工具)) ? 字(混.访客工具) : 默认配置.访客工具,
+    群工具: 工具档.has(字(混.群工具)) ? 字(混.群工具) : 默认配置.群工具,
+    房间工具: 规整房间工具(混.房间工具),
     访客: 规整访客(混.访客),
     黑名单: 规整黑名单(混.黑名单),
     群: 规整群(混.群),

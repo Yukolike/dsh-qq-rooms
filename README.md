@@ -47,10 +47,14 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 | 事件令牌 | 空 | 可空 |
 | 房间工作区 | 空 | 新房间的 cwd；空 = `~/.dsh/qq-rooms` |
 | 模型 | `deepseek-account/deepseek-flash` | `provider/model` |
-| 访客工具 | `none` | 访客房间的工具：`none` / `safe` / `standard` |
+| 访客工具 | `none` | 访客房间的**默认**工具档：`none` / `safe` / `standard` |
+| 群工具 | `none` | 群房间的**默认**工具档；群成员不可信，默认全禁；单群可在「房间」页覆盖 |
+| 房间工具 | 空 | 按房间覆盖上一条：「设置 → 房间」里每一间访客私聊都有一个下拉；**保存即生效**，不用重启、不用等下一句 |
 | 只发 [QQ] 块 | 关 | 开 = 只发正文里 `[QQ]…[/QQ]` 中间那段 |
 
 配置文件在 `~/.dsh/qq-rooms-config.json`，状态在 `~/.dsh/qq-rooms-state.json`。
+
+日志不再显示在设置页里，直接落盘到 `~/.dsh/qq-rooms-logs/plugin.log`（超过 2MB 轮转成 `plugin.1.log`）；设置页「操作」里点 **打开日志目录** 就能在资源管理器里打开。
 
 ## 主人指令（只在自己的私聊里生效）
 
@@ -78,6 +82,7 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 - `all`：所有消息都进，交给模型判断
 - 主人在群里说话：无视模式直接进
 - 成员白/黑名单：`members.allow` 为空表示不限制，`deny` 优先
+- **群房间的工具默认全禁**（`群工具 = none`）；要让某个群能跑工具，在「房间」页给那一行单独选档，保存即生效。群房是共享的，限制作用于整个群的 agent，不区分发言者。
 
 ## 发表情包
 
@@ -87,10 +92,15 @@ dsh plugin --profile desktop add github:Yukolike/dsh-qq-rooms
 
 ## 安全
 
-- **访客房间默认零工具**：建房后调用 `agent.ctx.tools.restrict({ allow: [] })`，模型请求头里的 `tools` 为 0，只能打字。主人私聊与群不受影响。
-- `访客工具` 可设 `none`（默认，全禁）/ `safe`（只留 `todo_write`）/ `standard`（不限制，不推荐）。
+- **访客 / 群房间默认不能调工具**：建房后 `agent.ctx.tools.restrict({ allow: ['<占位工具>'] })` 只放行一个占位工具，`none` 再用 `agent.ctx.tools.guard()` 把**执行**全拒掉。只有「主人的私聊」不受限；群房按 `群工具`（默认 `none`）走。
+- 为什么不直接「零工具」：DeepSeek 要求请求里**至少有一个非 deferred 工具**，而中途新增的工具是 deferred 的。别的插件注册在 agent 自己 scope 上的工具（例如 `dsh-fish-memory` 的 `remember`）`restrict` 遮不住（官方语义：masks intersect, scoped registrations stay visible）。零工具时第二轮起整个请求会 400（`tools: at least one tool must have defer_loading=false`）。所以留一个占位工具让请求合法，执行由 guard 拒绝。
+- `访客工具` 可设 `none`（默认：占位工具也不许执行）/ `safe`（只留 `todo_write`，可以真的记账）/ `standard`（不限制，不推荐）。
+- **可以实时换档**：每一间访客私聊在「房间」页单独选档，或改全局默认，点保存就当场生效——不需要重启 DSH，也不需要对方再发一条。换档时先 dispose 掉旧限制再装新的（`restrict` 的多次调用是**相交**的，只加不撤会越限越死，`standard` 也放不开）。
 - 这是 **agent 级运行时掩码**，不是 profile 隔离；`房间工作区` 仍建议指向空目录。
 - 默认总开关关、试运行开，装完不会立刻发消息。
+- **设置页接口只认「本人」**：插件挂在 webServer 上的地址不会自动带 DSH 的登录校验，所以每个请求先过宿主的信任检查；拿不到检查、或检查本身出错一律放行，只有宿主明确回 401/403 才拒。
+- **令牌只回遮罩**：`/state` 里的 `令牌` / `事件令牌` 是 `********`；设置页把它原样存回来不会覆盖真令牌，清空才会删掉。
+- `/save` 只收设置项：`房间`（运行时建立）与 `访客` / `黑名单`（走审批接口）不接受前端回传，免得拿着旧页面一保存就把新建的房间冲掉。
 
 ## 开发
 

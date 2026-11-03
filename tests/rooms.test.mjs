@@ -128,6 +128,45 @@ test('宿主里没有：先 resume', async () => {
   assert.equal(结果.created, false)
 })
 
+test('确保房间后回调登记（sessionId + cwd）', async () => {
+  const 仓 = 配置仓({ 房间工作区: 'D:/rooms' })
+  const 登记 = []
+  const 房 = new 房间管理器({
+    agents: 假agents().api, 读: 仓.读, 改: 仓.改, 家目录: 'C:/home',
+    登记: (id, cwd) => 登记.push({ id, cwd }),
+  })
+  const 结果 = await 房.确保('私聊:20001')
+  assert.equal(登记.length, 1)
+  assert.equal(登记[0].cwd, 'D:/rooms')
+  assert.equal(登记[0].id, 结果.sessionId)
+})
+
+test('归档过的会话不 resume，直接重建', async () => {
+  const 仓 = 配置仓({ 房间: { '私聊:20001': { sessionId: 'session-archived-1111', createdAt: 1, lastAt: 1 } } })
+  const { api, 调用 } = 假agents()
+  const 归档 = new Set(['session-archived-1111'])
+  const 房 = new 房间管理器({
+    agents: api, 读: 仓.读, 改: 仓.改, 家目录: 'C:/home',
+    已归档: (id) => 归档.has(String(id)),
+  })
+
+  const 结果 = await 房.确保('私聊:20001')
+  assert.equal(调用.resume.length, 0, '归档会话侧栏都看不到，不该再续')
+  assert.equal(调用.create.length, 1)
+  assert.equal(结果.created, true)
+  assert.notEqual(仓.当前().房间['私聊:20001'].sessionId, 'session-archived-1111')
+})
+
+test('房间列表标出已归档的会话', async () => {
+  const 仓 = 配置仓({ 房间: { '私聊:20001': { sessionId: 'session-archived-1111', createdAt: 1, lastAt: 1 } } })
+  const 房 = new 房间管理器({
+    agents: 假agents().api, 读: 仓.读, 改: 仓.改, 家目录: 'C:/home',
+    已归档: (id) => String(id).includes('archived'),
+  })
+  assert.equal(房.列表()[0].归档, true)
+  assert.equal(房.归档了('session-archived-1111'), true)
+})
+
 test('resume 失败：回落到 create，并换新 sessionId', async () => {
   const 仓 = 配置仓({ 房间: { '私聊:20001': { sessionId: 'session-cccccccc-3333', createdAt: 1, lastAt: 1 } } })
   const { api, 调用 } = 假agents({ resume: async () => { throw new Error('gone') } })

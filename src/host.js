@@ -9,10 +9,11 @@
 //   · 入站以 WebSocket 事件为主（否则无法发现陌生私聊），HTTP 轮询只补已知房间的漏
 
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { 读配置, 改配置, 归一化 } from './config.js'
+import { 读配置, 改配置, 可保存键 } from './config.js'
 import { 判定入站, 主人指令, 点名判定, 聊天键, 拆聊天键 } from './policy.js'
 import { 房间管理器, 房间标题, 房间工作区 } from './rooms.js'
 import {
@@ -27,21 +28,68 @@ const 路由前缀 = '/dsh-qq-rooms'
 const 日志上限 = 80
 const 唤醒窗口毫秒 = 10 * 60 * 1000
 
+/** 令牌回给前端时的遮罩：原样回传 = 「这个令牌没动」。 */
+const 令牌遮罩 = '********'
+
+/**
+ * DSH 会在你那句话后面再塞几条 user/message（运行环境、时间等）。
+ * 它们不是人打的字，不能拿来判断「这一轮是不是 QQ 叫醒的」。
+ */
+const 搭车注入 = new Set([
+  'runtime-context', 'time-context', 'skill-catalog', 'compact-checkpoint',
+  'model-selection', 'her-words', 'memory',
+])
+const 搭车前缀 = /^(?:repeat-tool-reminder|plugin:)/u
+
 export function apply(ctx) {
   const 家目录 = process.env.DSH_HOME || join(homedir(), '.dsh')
   const 收图目录 = join(家目录, 'qq-rooms-inbox')
   const 状态文件 = join(家目录, 'qq-rooms-state.json')
+  const 日志目录 = join(家目录, 'qq-rooms-logs')
+  const 日志文件 = join(日志目录, 'plugin.log')
 
   /* ---------------- 状态 ---------------- */
 
   const 日志 = []
+  let 日志写次数 = 0
+
+  /** 日志落盘（超过 2MB 轮转成 plugin.1.log）；写不进去也不影响收发。 */
+  const 落日志 = (行) => {
+    try {
+      mkdirSync(日志目录, { recursive: true })
+      appendFileSync(日志文件, 行 + '\n', 'utf8')
+      日志写次数 += 1
+      if (日志写次数 % 200 !== 0) return
+      try {
+        if (statSync(日志文件).size > 2 * 1024 * 1024) {
+          const 旧 = join(日志目录, 'plugin.1.log')
+          try {
+            unlinkSync(旧)
+          } catch {
+            /* 没有旧的 */
+          }
+          renameSync(日志文件, 旧)
+        }
+      } catch {
+        /* 轮转失败不影响继续写 */
+      }
+    } catch {
+      /* 磁盘写不进去就算了 */
+    }
+  }
   const 上一轮 = new Map() // 键 -> { 轮号, 文本, 图们 }
   const 已发轮 = new Set() // 键:轮号
   const 已转消息 = new Set()
   const 上次时间 = new Map()
   const 唤醒 = new Map() // 键 -> 时间戳
   const 待批 = new Map() // 号 -> { 时, 昵称, 文字, 条 }
-  const 己方消息 = new Set()
+  const 己方消息 = new Set() // 自己发出去的 message_id —— 群里「引用我」靠它对上
+  const 记己方消息 = (id) => {
+    const v = String(id ?? '').trim()
+    if (!v) return
+    己方消息.add(v)
+    if (己方消息.size > 800) 己方消息.clear()
+  }
   let 自己号 = ''
   let 轮询中 = false
   let 已停止 = false
@@ -61,11 +109,11 @@ export function apply(ctx) {
   const 记账 = (文本) => {
     const d = new Date()
     const 补 = (n) => String(n).padStart(2, '0')
-    日志.push({
-      时间: `${补(d.getMonth() + 1)}-${补(d.getDate())} ${补(d.getHours())}:${补(d.getMinutes())}:${补(d.getSeconds())}`,
-      文本: String(文本),
-    })
+    const 时间 = `${补(d.getMonth() + 1)}-${补(d.getDate())} ${补(d.getHours())}:${补(d.getMinutes())}:${补(d.getSeconds())}`
+    const 文 = String(文本)
+    日志.push({ 时间, 文本: 文 })
     if (日志.length > 日志上限) 日志.shift()
+    落日志(`${时间} ${文}`)
     try {
       ctx.logger?.info?.(`qq-rooms: ${文本}`)
     } catch {
@@ -94,13 +142,71 @@ export function apply(ctx) {
   const 读 = () => 读配置(家目录)
   const 改 = (变更) => 改配置(家目录, 变更)
 
+  const 工作区 = 服务('workspaceRegistry')
+  /** DSH 的归档清单：归档的会话侧栏里看不到，房间不该再续它。 */
+  const 已归档 = (sessionId) => {
+    try {
+      const 集 = 工作区 && 工作区.archivedSessionIds
+      if (!集) return false
+      const 号 = String(sessionId || '')
+      return typeof 集.has === 'function' ? 集.has(号) : Array.from(集).map(String).includes(号)
+    } catch {
+      return false
+    }
+  }
+
+  const 同路径 = (a, b) =>
+    String(a || '').replace(/[\\/]+$/u, '').toLowerCase() === String(b || '').replace(/[\\/]+$/u, '').toLowerCase()
+
+  /** 把会话登记进「房间工作区」对应的 workspace —— 侧栏才会归到那一栏，而不是「未分组」。 */
+  async function 登记工作区(sessionId, cwd) {
+    if (已归档(sessionId)) return
+    if (!工作区 || typeof 工作区.list !== 'function') return
+    let 目标 = null
+    try {
+      目标 = (工作区.list() || []).find((w) => 同路径(w.path, cwd))
+    } catch {
+      return
+    }
+    if (!目标 || (目标.sessionIds || []).includes(sessionId)) return
+
+    // 行上的字段是 id（不是 workspaceId）；加入会话用 Workspace 实体的 attachSession
+    const 区id = 目标.workspaceId || 目标.id
+    try {
+      const 实体 = typeof 工作区.get === 'function' ? 工作区.get(区id) : null
+      if (实体 && typeof 实体.attachSession === 'function') {
+        await 实体.attachSession(sessionId)
+        记账(`会话 ${String(sessionId).slice(-8)} 已归到工作区「${目标.title || 目标.path}」`)
+        return
+      }
+      if (实体 && typeof 实体.insertSessionBefore === 'function') {
+        await 实体.insertSessionBefore(sessionId)
+        记账(`会话 ${String(sessionId).slice(-8)} 已归到工作区「${目标.title || 目标.path}」`)
+        return
+      }
+      记账('登记工作区失败：实体没有 attachSession')
+    } catch (error) {
+      记账('登记工作区失败：' + String((error && error.message) || error))
+    }
+  }
+
+  /** 启动/保存时把已有房间补登记一遍（只对同名工作区）。 */
+  async function 补工作区(配置) {
+    const cwd = 房间工作区(配置, 家目录)
+    for (const 行 of Object.values(配置.房间 || {})) {
+      if (行.sessionId) await 登记工作区(行.sessionId, cwd)
+    }
+  }
+
   const 房间 = new 房间管理器({
     agents: 服务('agents'),
     读,
     改,
     家目录,
     日志: 记账,
-    工作区: 服务('workspaceRegistry'),
+    工作区,
+    已归档,
+    登记: 登记工作区,
   })
 
   const 传输 = (配置 = 读()) => new OneBot({ 地址: 配置.NapCat, 令牌: 配置.令牌, 日志: 记账 })
@@ -241,7 +347,26 @@ export function apply(ctx) {
 
   /* ---------------- 发送 ---------------- */
 
-  /** 发到一间房对应的聊天。返回结果数组（试运行/关闸 → 空数组）。 */
+  /** 真的发出去：不看总开关 / 试运行（「发送」和「测试一句」共用）。返回结果数组。 */
+  async function 裸发(配置, 键, 段们, 图数据) {
+    const 拆 = 拆聊天键(键)
+    if (!拆) return []
+    const 传 = 传输(配置)
+    const 结果 = []
+    if (段们.length) 结果.push(...(await 传.发文字(拆.类型, 拆.号码, 段们, { 间隔毫秒: 配置.拆段间隔毫秒 })))
+    if (图数据.length) 结果.push(...(await 传.发图片(拆.类型, 拆.号码, 图数据, { 间隔毫秒: 配置.拆段间隔毫秒 })))
+    // 记住自己发出去的 message_id —— 群里「引用我」就是靠它认出来的
+    for (const r of 结果) {
+      const id = r && r.ok && r.数据 && r.数据.data ? r.数据.data.message_id : undefined
+      if (id !== undefined && id !== null) 记己方消息(id)
+    }
+    const 好 = 结果.length > 0 && 结果.every((r) => r.ok)
+    记账(`${好 ? '✅ 已发到' : '⚠ 发送有问题'} ${键}：「${String(段们[0] || '').slice(0, 50)}」${图数据.length ? `（含 ${图数据.length} 张图）` : ''}`)
+    for (const r of 结果) if (!r.ok) 记账('   ' + r.action + ' 失败：' + JSON.stringify(r.数据).slice(0, 140))
+    return 结果
+  }
+
+  /** 带闸的发送：总开关 + 试运行。返回结果数组（试运行/关闸 → 空数组）。 */
   async function 发送(配置, 键, 段们, 图数据) {
     if (!配置.总开关) {
       记账('总开关关着，这条没发')
@@ -251,22 +376,19 @@ export function apply(ctx) {
       记账(`试运行：本来要发到 ${键} →「${String(段们[0] || '').slice(0, 40)}」${图数据.length ? `（还有 ${图数据.length} 张图）` : ''}`)
       return []
     }
-    const 拆 = 拆聊天键(键)
-    if (!拆) return []
-    const 传 = 传输(配置)
-    const 结果 = []
-    if (段们.length) 结果.push(...(await 传.发文字(拆.类型, 拆.号码, 段们, { 间隔毫秒: 配置.拆段间隔毫秒 })))
-    if (图数据.length) 结果.push(...(await 传.发图片(拆.类型, 拆.号码, 图数据, { 间隔毫秒: 配置.拆段间隔毫秒 })))
-    const 好 = 结果.length > 0 && 结果.every((r) => r.ok)
-    记账(`${好 ? '✅ 已发到' : '⚠ 发送有问题'} ${键}：「${String(段们[0] || '').slice(0, 50)}」${图数据.length ? `（含 ${图数据.length} 张图）` : ''}`)
-    for (const r of 结果) if (!r.ok) 记账('   ' + r.action + ' 失败：' + JSON.stringify(r.数据).slice(0, 140))
-    return 结果
+    return 裸发(配置, 键, 段们, 图数据)
   }
 
-  /** 私聊直发（回执、审批、测试用）；同样受试运行约束。 */
+  /** 私聊直发（回执、审批用）；同样受试运行约束。 */
   async function 发私聊(配置, 号码, 文字) {
     const 段们 = 配置.长回复拆段 ? 按段拆(文字) : [String(文字 || '').trim()].filter(Boolean)
     return 发送(配置, 聊天键('私聊', 号码), 段们, [])
+  }
+
+  /** 私聊直发，不看总开关和试运行 —— 只有设置页的「测试一句」用它。 */
+  async function 私聊裸发(配置, 号码, 文字) {
+    const 段们 = 配置.长回复拆段 ? 按段拆(文字) : [String(文字 || '').trim()].filter(Boolean)
+    return 裸发(配置, 聊天键('私聊', 号码), 段们, [])
   }
 
   /* ---------------- 出站 ---------------- */
@@ -320,6 +442,8 @@ export function apply(ctx) {
       const 数据 = event.data || {}
       const 源 = 数据.source || (数据.message && 数据.message.source)
       const 类 = String((源 && 源.kind) || '')
+      // 搭车的注入也是 user/message —— 它们不是人打的字，不能拿来判「这一轮是谁起的头」
+      if (搭车注入.has(类) || 搭车前缀.test(类)) return
       if (!类 || 类 === 'user') 唤醒.delete(键)
       return
     }
@@ -355,28 +479,116 @@ export function apply(ctx) {
 
   /* ---------------- 入站 ---------------- */
 
-  /** 已锁工具的 agent id（避免重复 restrict 叠加）。 */
-  const 已限工具 = new Set()
+  /** agent id -> { 策略, 摘遮罩, 摘守卫 }。留着 disposer 才能实时换档：restrictions 是相交的，不撤旧的松不开。 */
+  const 已限工具 = new Map()
+  /** 房间键 -> 活着的 agent：保存设置时用它立刻套用，不用等下一句。 */
+  const 键agent = new Map()
 
   /**
-   * 访客房间的工具闸门。DSH 没有“工具白名单”，但 `agent.ctx.tools.restrict({ allow })`
-   * 是 agent 级别的允许/拒绝掩码，必须在 agent scope 上调（宿主 ctx 会报错）。
-   * 实测：allow: [] 之后，模型请求头里的 tools = 0，聊天仍正常。
+   * 访客房间的工具闸门。
+   *
+   * DSH 的 `ctx.tools.restrict({ allow })` 只遮 **agent 从全局继承来的工具**；
+   * 别的插件注册在 agent 自己 scope 上的工具遮不住（官方文档原话：scoped registrations stay visible）。
+   * 而 DeepSeek 的接口要求请求里**至少有一个非 deferred 工具** —— 中途新增的工具是按 deferred 发的。
+   *
+   * 所以「真·零工具」没法表达：第一轮 tools 为空能过，第二轮只要谁中途塞进一个 scoped 工具，
+   * 整个请求就变成「全是 deferred」→ 400 INVALID_REQUEST（实测：dsh-fish-memory 的 remember）。
+   *
+   * 做法：allow 一个**全局**占位工具让请求合法；`none` 再用 `tools.guard()` 把执行全部拒掉。
+   * 占位只影响 schema，不带来任何能力 —— 选谁都被 guard 拒。
    */
+  const 占位候选 = ['list_mcp_resources', 'list_mcp_resource_templates', 'load_workspace_dependencies', 'get_goal', 'todo_write']
+
+  /**
+   * 用 allow 名单把可见工具收到「只剩一个占位」。
+   * @returns {{名: string, 摘: Function} | null} 占位名和撤掉这道遮罩的 disposer；点不到名 → null
+   */
+  function 装遮罩(器) {
+    let 最后错 = ''
+    for (const 名 of 占位候选) {
+      try {
+        return { 名, 摘: 器.restrict({ allow: [名] }) }
+      } catch (error) {
+        最后错 = String((error && error.message) || error)
+      }
+    }
+    // 候选都不在：错误信息里带着「known global tools: a, b, c …」，从里面挑一个只读的
+    const m = /known global tools:\s*([^)]*)/u.exec(最后错)
+    const 已知 = m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : []
+    const 挑 = 已知.find((名) => /^list_mcp_resources?$/u.test(名) || /__list_/u.test(名)) || 已知[0]
+    if (挑) {
+      try {
+        return { 名: 挑, 摘: 器.restrict({ allow: [挑] }) }
+      } catch {
+        /* 还是不行，走回落 */
+      }
+    }
+    return null
+  }
+
+  /** 撤掉某个 agent 上的旧限制（换档 / 改成主人 / 房间重建时用）。 */
+  function 释放工具限制(id) {
+    const 记 = 已限工具.get(String(id || ''))
+    if (!记) return
+    for (const 摘 of [记.摘遮罩, 记.摘守卫]) {
+      try {
+        摘?.()
+      } catch {
+        /* 已经失效 */
+      }
+    }
+    已限工具.delete(String(id || ''))
+  }
+
+  /** 这一间该用哪档：单房覆盖 > 按聊天类型的默认（群 / 访客）。 */
+  const 房间策略 = (配置, 键) => {
+    const 覆盖 = (配置.房间工具 || {})[键]
+    if (覆盖) return 覆盖
+    return String(键).startsWith('群:') ? (配置.群工具 || 'none') : 配置.访客工具
+  }
+
+  /** 套用（或换掉）一间房当前的工具档。同一档重复调用是空操作。 */
   function 限制访客工具(agent, 策略) {
-    if (!agent || 策略 === 'standard') return
+    if (!agent) return
     const id = agent.id || (agent.session && agent.session.id)
-    if (!id || 已限工具.has(id)) return
+    if (!id) return
+    const 现 = 已限工具.get(id)
+    if (现 && 现.策略 === 策略) return
+
+    const 器 = agent.ctx && agent.ctx.tools
+    if (!器 || typeof 器.restrict !== 'function') {
+      记账('访客工具限制：宿主没有 tools.restrict')
+      return
+    }
+    // 档位变了：先摘旧的 —— restrictions 相交，累加只会越限越死（standard 也放不开）
+    释放工具限制(id)
+
+    const 记 = { 策略, 摘遮罩: null, 摘守卫: null }
     try {
-      const 器 = agent.ctx && agent.ctx.tools
-      if (!器 || typeof 器.restrict !== 'function') {
-        记账('访客工具限制：宿主没有 tools.restrict')
+      if (策略 === 'standard') {
+        已限工具.set(id, 记)
+        记账(`访客工具已放开到 standard：${id}`)
         return
       }
-      const 过滤 = 策略 === 'safe' ? { allow: ['todo_write'] } : { allow: [] }
-      器.restrict(过滤)
-      已限工具.add(id)
-      记账(`访客房间工具已限制（${策略}）：${id}`)
+      const 遮 = 装遮罩(器)
+      if (遮) 记.摘遮罩 = 遮.摘
+      else {
+        记.摘遮罩 = 器.restrict({ allow: [] })
+        记账('没找到能点名的占位工具 —— 回落到零工具（这一间第二轮可能被 DeepSeek 拒）')
+      }
+      if (typeof 器.guard === 'function') {
+        try {
+          记.摘守卫 = 策略 === 'none'
+            ? 器.guard(() => '访客房间：工具已禁用')
+            : 器.guard((exec) => (exec && exec.name === 'todo_write' ? undefined : '访客房间：只允许 todo_write'))
+        } catch (error) {
+          记账('工具守卫装不上：' + String((error && error.message) || error))
+        }
+      } else if (策略 === 'none') {
+        记账('访客工具限制：宿主没有 tools.guard —— 占位工具仍可被执行')
+      }
+      已限工具.set(id, 记)
+      记账(`访客房间工具已限制（${策略}${遮 ? `，占位 ${遮.名}` : '，零工具'}）：${id}`)
     } catch (error) {
       记账('访客工具限制失败：' + String((error && error.message) || error))
     }
@@ -398,7 +610,14 @@ export function apply(ctx) {
   async function 转入(配置, { 键, 类型, 号码, 发送者, 文字, 图们, 条 }) {
     const 房 = await 房间.确保(键, { 昵称: 昵称(条) })
     const 拆 = 拆聊天键(键)
-    if (拆 && 拆.类型 === '私聊' && 拆.号码 !== String(配置.主人)) 限制访客工具(房.agent, 配置.访客工具)
+    // 房间是私聊就把对方昵称记到配置里，设置页直接显示（群名走启动补昵称）
+    if (拆 && 拆.类型 === '私聊') 记昵称(键, 昵称(条))
+    // 除了「主人的私聊」，所有房间都上闸门：群成员不可信，群房默认全禁；档位改了当场换
+    const 是主人私聊 = 拆 && 拆.类型 === '私聊' && 拆.号码 === String(配置.主人)
+    if (!是主人私聊) {
+      键agent.set(键, 房.agent)
+      限制访客工具(房.agent, 房间策略(配置, 键))
+    }
 
     const 收下 = await 收图(配置, 图们, 条.message_id)
     const 署名 = 类型 === '群'
@@ -474,6 +693,59 @@ export function apply(ctx) {
     }
   }
 
+  /** 查一个人的昵称（先问后端，拿不到返回空）。 */
+  async function 查昵称(配置, 号) {
+    const 传 = 传输(配置)
+    for (const 动作 of ['get_stranger_info', 'get_friend_info']) {
+      const d = await 传.拉任意(动作, { user_id: Number(号) })
+      const 名 = d && (d.nickname || d.card || d.remark)
+      if (名) return String(名).trim().slice(0, 24)
+    }
+    return ''
+  }
+
+  /** 查群名。 */
+  async function 查群名(配置, 群号) {
+    const d = await 传输(配置).拉任意('get_group_info', { group_id: Number(群号) })
+    return String((d && (d.group_name || d.name)) || '').trim().slice(0, 24)
+  }
+
+  /** 把昵称记到房间行上（设置页直接显示，不用每次现查）。 */
+  function 记昵称(键, 名) {
+    const 净 = String(名 || '').trim().slice(0, 24)
+    const 行 = (读().房间 || {})[键]
+    if (!净 || !行 || 行.昵称 === 净) return
+    改((旧) => ({ ...旧, 房间: { ...旧.房间, [键]: { ...(旧.房间 || {})[键], 昵称: 净 } } }))
+  }
+
+  /** 群表里没名称的问后端补上（只补缺的）。 */
+  async function 补群名(配置) {
+    for (const [号, 行] of Object.entries(配置.群 || {})) {
+      if (行.名称) continue
+      const 名 = await 查群名(配置, 号)
+      if (!名) continue
+      改((旧) => ({ ...旧, 群: { ...旧.群, [号]: { ...(旧.群 || {})[号], 名称: 名 } } }))
+    }
+  }
+
+  /** 启动后补一轮：老房间 / 老白名单的配置里还没有昵称，逐个问后端（只补缺的）。 */
+  async function 补昵称(配置) {
+    for (const [键, 行] of Object.entries(配置.房间 || {})) {
+      if (行.昵称) continue
+      const 拆 = 拆聊天键(键)
+      if (!拆) continue
+      const 名 = 拆.类型 === '群' ? await 查群名(配置, 拆.号码) : await 查昵称(配置, 拆.号码)
+      if (名) 记昵称(键, 名)
+    }
+    for (const [号, 行] of Object.entries(配置.访客 || {})) {
+      if (行.昵称) continue
+      const 名 = await 查昵称(配置, 号)
+      if (!名) continue
+      改((旧) => ({ ...旧, 访客: { ...旧.访客, [号]: { ...(旧.访客 || {})[号], 昵称: 名 } } }))
+    }
+    await 补群名(配置)
+  }
+
   async function 问主人(配置, 号, 谁, 文字, 条) {
     if (!配置.主人) return 记账(`陌生人 ${号} 私聊，但没设主人，没人可问`)
     const 旧 = 待批.get(号)
@@ -483,12 +755,17 @@ export function apply(ctx) {
       旧.文字 = 文字
       return
     }
-    待批.set(号, { 时: Date.now(), 昵称: 谁, 文字, 条 })
+    let 名 = String(谁 || '').trim()
+    if (!名) 名 = await 查昵称(配置, 号)
+    待批.set(号, { 时: Date.now(), 昵称: 名, 文字, 条 })
     const 文 = [
-      `【有人私聊我】${谁 || 'QQ ' + 号}（${号}）说：${String(文字 || '').slice(0, 200) || '（没字）'}`,
-      `要我接吗？回「同意」或「同意 ${号}」，不想接就回「拒绝」。`,
+      '【有人私聊我】',
+      `昵称：${名 || '（取不到昵称）'}`,
+      `QQ：${号}`,
+      `说：${String(文字 || '').slice(0, 200) || '（没字）'}`,
+      `回「同意」接他，回「拒绝」拉黑；要指定人就「同意 ${号}」。`,
     ].join('\n')
-    记账(`陌生人 ${号} 私聊，去问主人了`)
+    记账(`陌生人 ${号}${名 ? `（${名}）` : ''} 私聊，去问主人了`)
     await 发私聊(配置, 配置.主人, 文)
   }
 
@@ -531,10 +808,11 @@ export function apply(ctx) {
         const 目标 = 指令.号码 || 最近待批()
         if (!目标) return 回('现在没有人在等批准。要直接放行就回「同意 QQ号」。')
         const 缓存 = 待批.get(目标)
-        放行(目标, (缓存 && 缓存.昵称) || '')
+        const 名 = (缓存 && 缓存.昵称) || (await 查昵称(配置, 目标))
+        放行(目标, 名)
         待批.delete(目标)
-        记账(`主人同意了 ${目标}`)
-        await 回(`好，我接 ${目标} 了。`)
+        记账(`主人同意了 ${目标}${名 ? `（${名}）` : ''}`)
+        await 回(`好，我接 ${名 ? `${名}（${目标}）` : 目标} 了。`)
         if (缓存 && 缓存.条) {
           void 处理消息({ ...缓存.条, _补投: true }, '补投').catch(() => {})
         }
@@ -543,10 +821,12 @@ export function apply(ctx) {
       case 'deny': {
         const 目标 = 指令.号码 || 最近待批()
         if (!目标) return 回('现在没有人在等批准。要拉黑就回「拒绝 QQ号」。')
+        const 缓存 = 待批.get(目标)
+        const 名 = (缓存 && 缓存.昵称) || ''
         拉黑(目标)
         待批.delete(目标)
-        记账(`主人拒绝了 ${目标}（已拉黑）`)
-        return 回(`好，不理 ${目标} 了。他再来不会问你。`)
+        记账(`主人拒绝了 ${目标}${名 ? `（${名}）` : ''}（已拉黑）`)
+        return 回(`好，不理 ${名 ? `${名}（${目标}）` : 目标} 了。他再来不会问你。`)
       }
       case 'unblock': {
         const 号 = 指令.号码
@@ -558,10 +838,11 @@ export function apply(ctx) {
       case 'allow': {
         const 号 = 指令.号码
         if (!号) return 回('要放行谁？回「放行 QQ号」。')
-        放行(号, '')
+        const 名 = await 查昵称(配置, 号)
+        放行(号, 名)
         待批.delete(号)
-        记账(`主人直接放行了 ${号}`)
-        return 回(`好，${号} 进白名单了，以后直接聊。`)
+        记账(`主人直接放行了 ${号}${名 ? `（${名}）` : ''}`)
+        return 回(`好，${名 ? `${名}（${号}）` : 号} 进白名单了，以后直接聊。`)
       }
       case 'joinGroup': {
         改((旧) => ({
@@ -569,6 +850,7 @@ export function apply(ctx) {
           群: { ...旧.群, [指令.群号]: { ...(旧.群[指令.群号] || {}), enabled: true, mode: 指令.模式, addedAt: Date.now(), muteUntil: 0, members: (旧.群[指令.群号] && 旧.群[指令.群号].members) || { allow: [], deny: [] } } },
         }))
         记账(`主人接群 ${指令.群号}（${指令.模式}）`)
+        void 补群名(读()).catch(() => {})
         return 回(`好，接群 ${指令.群号} 了，模式：${指令.模式 === 'all' ? '听所有人' : '只回点名'}。`)
       }
       case 'leaveGroup': {
@@ -618,14 +900,21 @@ export function apply(ctx) {
 
   /* ---------------- 一条消息的完整判定 ---------------- */
 
-  async function 处理消息(条, 来源) {
+  /**
+   * 一条消息进来。
+   * @param 条     OneBot 消息（WS 事件 / 历史条目）
+   * @param 来源   'ws' | '轮询' | '补投'（只用来记日志）
+   * @param 指定   轮询时由调用方给出 { 类型, 号码 }：历史条目不一定带 message_type，
+   *               反推会把群消息当成「发送者的私聊」（于是每条群里的话都跑去问主人）。
+   */
+  async function 处理消息(条, 来源, 指定) {
     if (已停止) return
     const 配置 = 读()
     if (!配置.总开关) return
     if (!条 || 条.post_type && 条.post_type !== 'message') return
 
-    const 类型 = 条.message_type === 'group' ? '群' : '私聊'
-    const 号码 = String(类型 === '群' ? 条.group_id : 条.user_id)
+    const 类型 = 指定 && 指定.类型 ? 指定.类型 : (条.message_type === 'group' ? '群' : '私聊')
+    const 号码 = String(指定 && 指定.号码 ? 指定.号码 : (类型 === '群' ? 条.group_id : 条.user_id))
     const 发送者 = String(条.user_id || '')
     const 键 = 聊天键(类型, 号码)
     if (!键) return
@@ -670,7 +959,12 @@ export function apply(ctx) {
     })
 
     const 判定 = 判定入站({ 类型, 号码, 发送者, 配置, 点名 })
-    if (判定.action === 'drop') return
+    if (判定.action === 'drop') {
+      // 丢掉也要记账：轮询的水位只在「进过已转消息」时才前进，
+      // 否则群里一条没点名的闲聊会被每 2 秒重新解析一遍（转发展开、语音转写跟着重跑）。
+      已转消息.add(id)
+      return
+    }
     if (判定.action === 'askOwner') {
       await 问主人(配置, 号码, 昵称(条), 解析.文字 || (解析.图们.length ? '（发来图片）' : ''), 条)
       已转消息.add(id)
@@ -802,7 +1096,7 @@ export function apply(ctx) {
             上次 = Math.max(上次, 时)
             continue
           }
-          await 处理消息(条, '轮询')
+          await 处理消息(条, '轮询', { 类型: t.类型, 号码: t.号码 })
           if (已转消息.has(String(条.message_id))) 上次 = Math.max(上次, 时)
         }
         上次时间.set(键, 上次)
@@ -841,6 +1135,13 @@ export function apply(ctx) {
     }
   }
 
+  /** 回给浏览器之前把令牌遮掉：设置页只用来显示「设过了没」，不需要明文。 */
+  const 遮令牌 = (配置) => ({
+    ...配置,
+    令牌: 配置.令牌 ? 令牌遮罩 : '',
+    事件令牌: 配置.事件令牌 ? 令牌遮罩 : '',
+  })
+
   async function 概况() {
     const 配置 = 读()
     const 传 = 传输(配置)
@@ -851,13 +1152,35 @@ export function apply(ctx) {
       协议: 1,
       冲突,
       原版状态,
-      配置,
+      配置: 遮令牌(配置),
       房间: 房间.列表(),
       待批: [...待批.entries()].map(([号, v]) => ({ 号, 昵称: v.昵称, 文字: String(v.文字 || '').slice(0, 120), 时: v.时 })),
       日志,
       NapCat: 登录 ? { ok: true, 号: 登录 } : { ok: false, 错: '连不上或没登录' },
       自己号,
     }
+  }
+
+  /**
+   * 管理接口只认「本人」：插件挂在 webServer 上的地址不会自动带 DSH 的登录校验，
+   * 随便一个网页都能 POST 到 /save 改配置、或者 /test-send 替你发消息。
+   * 一律「失败就放行」：拿不到 connection 服务、老宿主没这个接口、检查本身抛错 —— 全当没事，
+   * 免得宿主换个版本把设置页锁死；只有宿主**明确**说 401 / 403 才拒。
+   */
+  const 只认本人 = async (req, res) => {
+    try {
+      const 连接 = 服务('connection')
+      let 拒 = 连接 && typeof 连接.requestRejection === 'function' ? 连接.requestRejection(req) : undefined
+      if (拒 && typeof 拒.then === 'function') 拒 = await 拒
+      if (拒 === 401 || 拒 === 403) {
+        记账(`管理接口拒了一次外来请求（${拒}）：${String((req && req.url) || '')}`)
+        回(res, { ok: false, 说: 拒 === 401 ? '需要先登录 DSH' : '这个来源不允许改设置' })
+        return false
+      }
+    } catch {
+      /* 鉴权这条路自己坏了 → 放行 */
+    }
+    return true
   }
 
   const 路线 = (路径, handler) =>
@@ -867,6 +1190,7 @@ export function apply(ctx) {
         path: 路径,
         handler: async (req, res) => {
           try {
+            if (!(await 只认本人(req, res))) return
             await handler(req, res)
           } catch (error) {
             回(res, { ok: false, 说: String((error && error.message) || error) })
@@ -879,26 +1203,49 @@ export function apply(ctx) {
     try {
       回(res, await 概况())
     } catch (error) {
-      回(res, { ok: false, 说: '状态读不出来：' + String((error && error.message) || error), 配置: 读(), 日志 })
+      回(res, { ok: false, 说: '状态读不出来：' + String((error && error.message) || error), 配置: 遮令牌(读()), 日志 })
     }
   })
 
   路线(`${路由前缀}/save`, async (req, res) => {
     const 来 = await 读体(req)
     const 旧 = 读()
-    const 新 = 归一化({ ...旧, ...(来 && typeof 来 === 'object' ? 来 : {}) })
+    const 新 = { ...旧 }
+    if (来 && typeof 来 === 'object') {
+      // 只收「设置项」：房间 / 访客 / 黑名单由宿主维护，前端拿的是旧快照，写回会把它们冲掉
+      for (const k of 可保存键) if (k in 来) 新[k] = 来[k]
+      // 前端看到的是遮罩，原样回传 = 这个令牌没动
+      if (来.令牌 === 令牌遮罩) 新.令牌 = 旧.令牌
+      if (来.事件令牌 === 令牌遮罩) 新.事件令牌 = 旧.事件令牌
+    }
     const { 成功 } = 改(() => 新)
     if (!成功) return 回(res, { ok: false, 说: '写不进配置文件' })
     记账('设置已保存')
+    // 立刻套用到活着的房间（访客私聊 + 群）：不用等对方再发一条
+    const 新读 = 读()
+    // 新加的群还没名字：后台问一次（不挡保存）
+    void 补群名(新读).catch(() => {})
+    // 工作区可能换了：把房间会话补登记过去
+    void 补工作区(新读).catch(() => {})
+    for (const [键, agent] of [...键agent]) {
+      const 拆 = 拆聊天键(键)
+      const 是主人私聊 = 拆 && 拆.类型 === '私聊' && 拆.号码 === String(新读.主人)
+      if (!拆 || 是主人私聊) {
+        释放工具限制(agent.id || (agent.session && agent.session.id))
+        键agent.delete(键)
+        continue
+      }
+      限制访客工具(agent, 房间策略(新读, 键))
+    }
     回(res, await 概况())
   })
 
   路线(`${路由前缀}/test-send`, async (req, res) => {
-    const 来 = await 读体(req)
     const 配置 = 读()
     if (!配置.主人) return 回(res, { ok: false, 说: '先设置主人 QQ 号' })
-    const 结果 = await 发私聊(配置, 配置.主人, '（这是一条测试消息：DSH → QQ 通了）')
-    回(res, { ok: 结果.length > 0 && 结果.every((r) => r.ok), 说: 结果.length ? '已发' : '没发（看日志：试运行/总开关）', 日志 })
+    // 手动测试是**真发**：总开关和试运行都绕过（否则测试永远测不出通不通）
+    const 结果 = await 私聊裸发(配置, 配置.主人, '（这是一条测试消息：DSH → QQ 通了）')
+    回(res, { ok: 结果.length > 0 && 结果.every((r) => r.ok), 说: 结果.length ? '已发' : '没发（看日志）', 日志 })
   })
 
   路线(`${路由前缀}/approve`, async (req, res) => {
@@ -912,10 +1259,12 @@ export function apply(ctx) {
       return
     }
     const 缓存 = 待批.get(号)
-    放行(号, (缓存 && 缓存.昵称) || '')
+    let 名 = (缓存 && 缓存.昵称) || ''
+    if (!名) 名 = await 查昵称(读(), 号)
+    放行(号, 名)
     待批.delete(号)
     if (缓存 && 缓存.条) void 处理消息({ ...缓存.条, _补投: true }, '补投').catch(() => {})
-    回(res, { ok: true, 说: '已同意 ' + 号 })
+    回(res, { ok: true, 说: 名 ? `已同意 ${名}（${号}）` : '已同意 ' + 号 })
   })
 
   路线(`${路由前缀}/unblock`, async (req, res) => {
@@ -933,7 +1282,26 @@ export function apply(ctx) {
     if (来.操作 === 'reset') 房间.重置(键)
     else if (来.操作 === 'forget') 房间.遗忘(键)
     else return 回(res, { ok: false, 说: '未知操作' })
+    键agent.delete(键)
     回(res, { ok: true, 房间: 房间.列表() })
+  })
+
+  路线(`${路由前缀}/logs`, async (_req, res) => {
+    try {
+      mkdirSync(日志目录, { recursive: true })
+      const [命令, 参数] =
+        process.platform === 'win32'
+          ? ['explorer.exe', [日志目录]]
+          : process.platform === 'darwin'
+            ? ['open', [日志目录]]
+            : ['xdg-open', [日志目录]]
+      const 子 = spawn(命令, 参数, { detached: true, stdio: 'ignore' })
+      子.on('error', () => {})
+      子.unref()
+      回(res, { ok: true, 目录: 日志目录 })
+    } catch (error) {
+      回(res, { ok: false, 说: String((error && error.message) || error) })
+    }
   })
 
   /* ---------------- 挂监听 ---------------- */
@@ -992,6 +1360,16 @@ export function apply(ctx) {
         }
       }
     }, 'qq-rooms: 补漏轮询')
+
+    // 老房间的配置里没有昵称 / 没归到工作区：启动 2 秒后各补一轮（失败就算了）
+    ctx.effect(() => {
+      const 定 = setTimeout(() => {
+        void 补昵称(读()).catch(() => {})
+        void 补工作区(读()).catch(() => {})
+      }, 2000)
+      定.unref?.()
+      return () => clearTimeout(定)
+    }, 'qq-rooms: 补昵称')
   }
 
   记账(

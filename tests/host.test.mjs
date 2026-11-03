@@ -32,6 +32,12 @@ function 环境(配置 = {}) {
     if (u.includes('get_login_info')) {
       return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { user_id: 10001, nickname: 'me' } }) }
     }
+    if (u.includes('get_stranger_info') || u.includes('get_friend_info')) {
+      return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { user_id: 20001, nickname: '远端昵称' } }) }
+    }
+    if (u.includes('get_group_info')) {
+      return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { group_id: 30001, group_name: '测试群' } }) }
+    }
     if (u.includes('_msg_history')) {
       return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { messages: [] } }) }
     }
@@ -40,6 +46,8 @@ function 环境(配置 = {}) {
 
   const 跟进 = []
   const 限制 = []
+  const 守卫 = []
+  const 撤销 = []
   const 事件handler = []
   const 效果 = []
   const 定时 = []
@@ -55,7 +63,28 @@ function 环境(配置 = {}) {
     id: sessionId,
     session: { id: sessionId, append: async () => {} },
     followup: async (m) => { 跟进.push(m) },
-    ctx: { tools: { restrict: (f) => { 限制.push(f); return () => {} } } },
+    ctx: {
+      tools: {
+        restrict: (f) => {
+          限制.push(f)
+          let 关 = false
+          return () => {
+            if (关) return
+            关 = true
+            撤销.push(['restrict', f])
+          }
+        },
+        guard: (g) => {
+          守卫.push(g)
+          let 关 = false
+          return () => {
+            if (关) return
+            关 = true
+            撤销.push(['guard'])
+          }
+        },
+      },
+    },
   })
 
   const ctx = {
@@ -84,7 +113,7 @@ function 环境(配置 = {}) {
   }
 
   return {
-    家, 请求, 跟进, 限制, 事件handler, 效果, 定时, 路由, ctx,
+    家, 请求, 跟进, 限制, 守卫, 撤销, 事件handler, 效果, 定时, 路由, ctx,
     配置: () => JSON.parse(readFileSync(join(家, 'qq-rooms-config.json'), 'utf8')),
     清理: () => { globalThis.fetch = 原fetch },
   }
@@ -440,10 +469,477 @@ test('访客房间自动锁工具；主人私聊不锁', async () => {
     await api.处理消息(消息())
     await 等一拍()
     assert.equal(e.限制.length, 1, '访客房间应调用一次 restrict')
-    assert.deepEqual(e.限制[0], { allow: [] }, '默认 none：全部掩掉')
+    assert.deepEqual(e.限制[0], { allow: ['list_mcp_resources'] }, '必须留一个可点名的全局占位工具')
+    assert.equal(e.守卫.length, 1, '默认 none：再装一道执行守卫')
+    assert.match(String(e.守卫[0]({ name: 'remember' })), /禁用/u, '守卫要拒绝执行')
+    assert.match(String(e.守卫[0]({ name: 'list_mcp_resources' })), /禁用/u, '占位工具自身也不许执行')
     const 前 = e.限制.length
     await api.处理消息(消息({ user_id: 10000, message_id: 2 }))
     await 等一拍()
     assert.equal(e.限制.length, 前, '主人私聊不锁工具')
+  } finally { e.清理() }
+})
+
+test('访客工具 safe：占位工具之外只放行 todo_write', async () => {
+  const e = 环境({ 访客工具: 'safe', 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.deepEqual(e.限制[0], { allow: ['list_mcp_resources'] })
+    assert.equal(e.守卫.length, 1)
+    assert.equal(e.守卫[0]({ name: 'todo_write' }), undefined, 'safe 允许 todo_write')
+    assert.match(String(e.守卫[0]({ name: 'remember' })), /只允许/u)
+  } finally { e.清理() }
+})
+
+test('占位候选全点不到名时回落到零工具，绝不裸奔', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  const 调用 = []
+  const 原create = e.ctx.agents.create
+  e.ctx.agents.create = async ({ sessionId }) => {
+    const 句柄 = await 原create({ sessionId })
+    句柄.agent.ctx.tools.restrict = (f) => {
+      调用.push(f)
+      if (Array.isArray(f.allow) && f.allow.length) throw new Error('tools.restrict() names unknown global tool')
+      return () => {}
+    }
+    return 句柄
+  }
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.ok(调用.length > 1, '应该逐个试过占位候选')
+    assert.deepEqual(调用.at(-1), { allow: [] }, '全都点不到名时必须回落到零工具，不能一个掩码都没装上')
+    assert.match(api.日志.map((x) => x.文本).join('\n'), /回落到零工具/u)
+  } finally { e.清理() }
+})
+
+test('占位候选不在时，从 restrict 报错里的全局清单挑一个', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  const 调用 = []
+  const 原create = e.ctx.agents.create
+  e.ctx.agents.create = async ({ sessionId }) => {
+    const 句柄 = await 原create({ sessionId })
+    句柄.agent.ctx.tools.restrict = (f) => {
+      调用.push(f)
+      const 名 = Array.isArray(f.allow) ? f.allow[0] : ''
+      if (名 === 'mcp__x__list_pages') return () => {}
+      throw new Error(
+        `tools.restrict() names unknown global tool "${名}"; known global tools: android_app_info, mcp__x__list_pages, android_backtrace`,
+      )
+    }
+    return 句柄
+  }
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.deepEqual(调用.at(-1), { allow: ['mcp__x__list_pages'] }, '按清单挑一个只读型占位')
+    assert.match(api.日志.map((x) => x.文本).join('\n'), /占位 mcp__x__list_pages/u)
+  } finally { e.清理() }
+})
+
+test('实时换档：保存后立刻撤掉旧遮罩与守卫（none → standard）', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.equal(e.限制.length, 1)
+    assert.equal(e.守卫.length, 1)
+
+    // 不重启、不等新消息：保存设置就当场换档
+    const 存 = await 打路由(e, '/dsh-qq-rooms/save', { 房间工具: { '私聊:20001': 'standard' } })
+    assert.equal(存.ok, true)
+    assert.deepEqual(e.撤销, [
+      ['restrict', { allow: ['list_mcp_resources'] }],
+      ['guard'],
+    ], '先撤旧的：restrictions 相交，不撤松不开')
+    assert.equal(e.限制.length, 1, 'standard 不该再装新遮罩')
+    assert.equal(e.守卫.length, 1, 'standard 不该再装守卫')
+
+    // 再发一条也不会重复装
+    await api.处理消息(消息({ message_id: 2 }))
+    await 等一拍()
+    assert.equal(e.限制.length, 1)
+    assert.equal(e.守卫.length, 1)
+  } finally { e.清理() }
+})
+
+test('实时换档：standard → none 会重新装上限制', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } }, 房间工具: { '私聊:20001': 'standard' } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.equal(e.限制.length, 0, '覆盖为 standard：建房时不装')
+
+    await 打路由(e, '/dsh-qq-rooms/save', { 房间工具: {} })
+    assert.equal(e.限制.length, 1, '改回默认 none 应立刻装回')
+    assert.deepEqual(e.限制[0], { allow: ['list_mcp_resources'] })
+    assert.equal(e.守卫.length, 1)
+  } finally { e.清理() }
+})
+
+test('每房覆盖：safe 与 none 各自生效，互不影响', async () => {
+  const e = 环境({
+    访客: { 20001: { 昵称: '', 准到: 0 }, 20002: { 昵称: '', 准到: 0 } },
+    房间工具: { '私聊:20002': 'safe' },
+  })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await api.处理消息(消息({ user_id: 20002, message_id: 2 }))
+    await 等一拍()
+    assert.equal(e.限制.length, 2)
+    assert.equal(e.守卫.length, 2)
+    assert.match(String(e.守卫[0]({ name: 'todo_write' })), /禁用/u, '20001 默认 none')
+    assert.equal(e.守卫[1]({ name: 'todo_write' }), undefined, '20002 覆盖为 safe')
+  } finally { e.清理() }
+})
+
+test('日志落盘：apply 之后就有 plugin.log，页面不再需要显示日志', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const p = join(e.家, 'qq-rooms-logs', 'plugin.log')
+    assert.ok(existsSync(p), '应该建出日志文件')
+    assert.match(readFileSync(p, 'utf8'), /已装好/u)
+  } finally { e.清理() }
+})
+
+test('房间列表显示昵称，并写进配置', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ sender: { nickname: '小明' } }))
+    await 等一拍()
+    const 态 = await 打路由(e, '/dsh-qq-rooms/state')
+    const 房 = 态.房间.find((x) => x.键 === '私聊:20001')
+    assert.equal(房.昵称, '小明')
+    assert.equal(e.配置().房间['私聊:20001'].昵称, '小明')
+  } finally { e.清理() }
+})
+
+test('陌生人来信：审批消息带昵称、QQ、原话', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ sender: { nickname: '小明' } }))
+    const 文 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).map((r) => JSON.stringify(r.body)).join('\n')
+    assert.match(文, /昵称：小明/u)
+    assert.match(文, /QQ：20001/u)
+    assert.match(文, /说：你好/u)
+    assert.doesNotMatch(文, /QQ 20001（20001）/u, '不该再出现重复号码的旧格式')
+  } finally { e.清理() }
+})
+
+test('来信没带昵称：审批消息用后端查到的昵称', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ sender: {} }))
+    const 文 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).map((r) => JSON.stringify(r.body)).join('\n')
+    assert.match(文, /昵称：远端昵称/u)
+  } finally { e.清理() }
+})
+
+test('同意：回执带昵称，昵称也写进白名单', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ sender: { nickname: '小明' } }))
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '同意' } }] }))
+    await 等一拍()
+    const 文 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).map((r) => JSON.stringify(r.body)).join('\n')
+    assert.match(文, /好，我接 小明（20001） 了/u)
+    assert.equal(e.配置().访客['20001'].昵称, '小明')
+  } finally { e.清理() }
+})
+
+test('手动加白名单：顺手查昵称并写进配置', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const 回 = await 打路由(e, '/dsh-qq-rooms/approve', { 号: '20009', 允许: true })
+    assert.equal(回.ok, true)
+    assert.match(回.说, /远端昵称/u)
+    assert.equal(e.配置().访客['20009'].昵称, '远端昵称')
+  } finally { e.清理() }
+})
+
+test('群名称：接群后自动查群名并写进配置', async () => {
+  const e = 环境()
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '接群 30001' } }] }))
+    await 等一拍()
+    const 态 = await 打路由(e, '/dsh-qq-rooms/state')
+    assert.equal(态.配置.群['30001'].名称, '测试群')
+  } finally { e.清理() }
+})
+
+test('建房后把会话登记进「房间工作区」对应的 workspace', async () => {
+  const e = 环境({ 访客: { 20001: { 昵称: '', 准到: 0 } }, 房间工作区: 'D:\\MioWork\\dfyQQ' })
+  const 登记 = []
+  e.ctx.workspaceRegistry = {
+    archiveSession: () => {},
+    list: () => [{ id: 'w-dfyqq', title: 'dfyQQ', path: 'D:\\MioWork\\dfyQQ', sessionIds: [] }],
+    get: (id) => ({
+      attachSession: async (sessionId) => {
+        登记.push({ workspaceId: id, sessionId })
+      },
+    }),
+  }
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等一拍()
+    assert.equal(登记.length, 1, '建房后应登记一次')
+    assert.equal(登记[0].workspaceId, 'w-dfyqq')
+    assert.match(登记[0].sessionId, /^session-/u)
+  } finally { e.清理() }
+})
+
+test('群房也上工具闸门：默认 none', async () => {
+  const e = 环境({ 群: 群表() })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({
+      message_type: 'group', group_id: 30001, user_id: 40001, message_id: 10,
+      sender: { nickname: '群友' },
+      message: [{ type: 'at', data: { qq: '10001' } }, { type: 'text', data: { text: ' 在吗' } }],
+    }))
+    await 等一拍()
+    assert.equal(e.限制.length, 1, '群房也要装遮罩')
+    assert.deepEqual(e.限制[0], { allow: ['list_mcp_resources'] })
+    assert.equal(e.守卫.length, 1, '默认 none 要装执行守卫')
+    assert.match(String(e.守卫[0]({ name: 'remember' })), /禁用/u)
+  } finally { e.清理() }
+})
+
+test('群工具 safe 生效；单群覆盖保存后立刻换档', async () => {
+  const e = 环境({ 群: 群表(), 群工具: 'safe' })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({
+      message_type: 'group', group_id: 30001, user_id: 40001, message_id: 10,
+      sender: { nickname: '群友' },
+      message: [{ type: 'at', data: { qq: '10001' } }, { type: 'text', data: { text: ' 在吗' } }],
+    }))
+    await 等一拍()
+    assert.equal(e.守卫[0]({ name: 'todo_write' }), undefined, 'safe 允许 todo_write')
+
+    await 打路由(e, '/dsh-qq-rooms/save', { 房间工具: { '群:30001': 'none' } })
+    assert.equal(e.限制.length, 2, '换档要重新装遮罩')
+    assert.match(String(e.守卫[1]({ name: 'todo_write' })), /禁用/u, '覆盖成 none 后连 todo 也拒')
+  } finally { e.清理() }
+})
+
+/* ---------------- 回归：走查出来那几个 ---------------- */
+
+/** 直接调一条 /dsh-qq-rooms/* 路由（假 req/res）。 */
+async function 打路由(e, 路径, 体) {
+  const 路 = e.路由.find((r) => r.path === 路径)
+  assert.ok(路, '路由没注册：' + 路径)
+  let 出 = ''
+  const req = {
+    url: 路径,
+    headers: {},
+    [Symbol.asyncIterator]: async function* () { yield Buffer.from(JSON.stringify(体 || {})) },
+  }
+  const res = { setHeader() {}, end(v) { 出 = String(v) } }
+  await 路.handler(req, res)
+  return JSON.parse(出)
+}
+
+const 等干完 = (ms = 200) => new Promise((r) => setTimeout(r, ms))
+
+const 群表 = (号 = '30001') => ({ [号]: { enabled: true, mode: 'mention', addedAt: 1, muteUntil: 0, members: { allow: [], deny: [] } } })
+
+test('群：引用我发过的那条也算点名（发送后要记住 message_id）', async () => {
+  const e = 环境({ 群: 群表() })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    const 群消息 = (补) => 消息({ message_type: 'group', group_id: 30001, user_id: 40001, sender: { nickname: '群友' }, ...补 })
+
+    await api.处理消息(群消息({
+      message_id: 10,
+      message: [{ type: 'at', data: { qq: '10001' } }, { type: 'text', data: { text: ' 在吗' } }],
+    }))
+    assert.equal(e.跟进.length, 1, '@我 进房')
+
+    const 房 = e.配置().房间['群:30001']
+    const 派 = e.事件handler[0]
+    const 会话 = { id: 房.sessionId }
+    派(会话, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '在' }] } } })
+    派(会话, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await 等干完()
+
+    // 假后端对所有发送都回 message_id: 1
+    await api.处理消息(群消息({
+      message_id: 11,
+      user_id: 40002,
+      message: [{ type: 'reply', data: { id: '1' } }, { type: 'text', data: { text: '这句呢' } }],
+    }))
+    assert.equal(e.跟进.length, 2, '引用我发的那条应该进房')
+  } finally { e.清理() }
+})
+
+test('轮询：群历史条目没有 message_type 时按请求目标判定，不当成私聊', async () => {
+  const e = 环境({ 群: 群表() })
+  const 原fetch = globalThis.fetch
+  globalThis.fetch = async (url, opt) => {
+    if (String(url).includes('get_group_msg_history')) {
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'ok', retcode: 0, data: {
+            messages: [{
+              message_id: 700, time: Math.floor(Date.now() / 1000), user_id: 40001,
+              sender: { nickname: '群友' }, message: [{ type: 'text', data: { text: '随便说' } }],
+            }],
+          },
+        }),
+      }
+    }
+    return 原fetch(url, opt)
+  }
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    e.定时[0].fn()
+    await 等干完()
+
+    const 问主人 = e.请求.filter((r) => r.u.endsWith('/send_private_msg') && JSON.stringify(r.body).includes('有人私聊我'))
+    assert.equal(问主人.length, 0, '群历史不能当成发送者的私聊去问主人')
+    assert.equal(e.跟进.length, 0, 'mention 模式未点名 → 丢弃')
+  } finally { globalThis.fetch = 原fetch; e.清理() }
+})
+
+test('轮询：丢弃的消息记进已转，下一跳不再重解析', async () => {
+  const e = 环境({ 群: 群表() })
+  const 原fetch = globalThis.fetch
+  let 转发 = 0
+  globalThis.fetch = async (url, opt) => {
+    const u = String(url)
+    if (u.includes('get_group_msg_history')) {
+      return {
+        ok: true,
+        json: async () => ({
+          status: 'ok', retcode: 0, data: {
+            messages: [{
+              message_id: 701, time: Math.floor(Date.now() / 1000), message_type: 'group',
+              group_id: 30001, user_id: 40001, sender: { nickname: '群友' },
+              message: [{ type: 'text', data: { text: '闲聊' } }, { type: 'forward', data: { id: 'F1' } }],
+            }],
+          },
+        }),
+      }
+    }
+    if (u.includes('get_forward_msg')) {
+      转发 += 1
+      return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { messages: [] } }) }
+    }
+    return 原fetch(url, opt)
+  }
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    e.定时[0].fn()
+    await 等干完()
+    const 一次 = 转发
+    assert.ok(一次 > 0, '第一次应该解析转发')
+
+    e.定时[0].fn()
+    await 等干完()
+    assert.equal(转发, 一次, '丢弃后不该每跳重解析（转发接口会被重复调用）')
+  } finally { globalThis.fetch = 原fetch; e.清理() }
+})
+
+test('测试一句：绕过总开关和试运行，真发一条给主人', async () => {
+  const e = 环境({ 总开关: false, 试运行: true })
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const 回 = await 打路由(e, '/dsh-qq-rooms/test-send')
+    const 发 = e.请求.filter((r) => r.u.endsWith('/send_private_msg'))
+    assert.equal(发.length, 1, '手动测试要真发')
+    assert.equal(发[0].body.user_id, 10000)
+    assert.equal(回.ok, true)
+  } finally { e.清理() }
+})
+
+test('保存设置：不清房间表、不回滚访客、遮罩不会写掉令牌', async () => {
+  const e = 环境({
+    令牌: 'SECRET-TOKEN',
+    房间: { '私聊:20001': { sessionId: 'session-bbbbbbbb-2222', createdAt: 1, lastAt: 1 } },
+    访客: { 20003: { 昵称: '老朋友', 准到: 0 } },
+  })
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const 状态 = await 打路由(e, '/dsh-qq-rooms/state')
+    assert.equal(状态.配置.令牌, '********', '令牌只回遮罩')
+    assert.doesNotMatch(JSON.stringify(状态), /SECRET-TOKEN/u, '/state 不能漏明文令牌')
+
+    // 前端把页面打开时那份旧快照整份回传（房间 / 访客都是空的）
+    await 打路由(e, '/dsh-qq-rooms/save', { ...状态.配置, 房间: {}, 访客: {}, 总开关: true })
+    const 盘 = e.配置()
+    assert.ok(盘.房间['私聊:20001'], '房间表不能被前端快照冲掉')
+    assert.ok(盘.访客['20003'], '访客表不能被前端快照回滚')
+    assert.equal(盘.令牌, 'SECRET-TOKEN', '遮罩原样回传 = 令牌没动')
+  } finally { e.清理() }
+})
+
+test('管理接口：宿主明确 403 就拒绝，不写配置', async () => {
+  const e = 环境()
+  e.ctx.get = (名) => (名 === 'connection' ? { requestRejection: () => 403 } : undefined)
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const 回 = await 打路由(e, '/dsh-qq-rooms/save', { 总开关: false })
+    assert.equal(回.ok, false)
+    assert.equal(e.配置().总开关, true, '被拒的请求不该写配置')
+  } finally { e.清理() }
+})
+
+test('搭车注入（runtime-context）不清「QQ 唤醒」', async () => {
+  const e = 环境({ 只回QQ唤醒: true, 访客: { 20001: { 昵称: '', 准到: 0 } } })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await 等干完()
+    const 房 = e.配置().房间['私聊:20001']
+    const 派 = e.事件handler[0]
+    const 会话 = { id: 房.sessionId }
+    const 发到访客 = () => e.请求.filter((r) => r.u.endsWith('/send_private_msg') && r.body.user_id === 20001)
+
+    派(会话, { type: 'user/message', data: { source: { kind: 'runtime-context' }, content: [] } })
+    派(会话, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '回一句' }] } } })
+    派(会话, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await 等干完()
+
+    assert.equal(发到访客().length, 1, '注入不该把这一轮判成本机手打')
   } finally { e.清理() }
 })

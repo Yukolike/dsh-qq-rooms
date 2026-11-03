@@ -59,6 +59,8 @@ export class 房间管理器 {
   #改
   #日志
   #家目录
+  #已归档 = () => false
+  #登记 = null
   #句柄 = new Map()
   #进行中 = new Map()
 
@@ -71,13 +73,20 @@ export class 房间管理器 {
    * @param {(文本: string) => void} [依赖.日志]
    * @param {object} [依赖.工作区]      ctx.workspaceRegistry（可选，用于归档）
    */
-  constructor({ agents, 读, 改, 家目录, 日志, 工作区 }) {
+  constructor({ agents, 读, 改, 家目录, 日志, 工作区, 已归档, 登记 }) {
     this.#agents = agents
     this.#读 = 读
     this.#改 = 改
     this.#家目录 = 家目录
     this.#日志 = typeof 日志 === 'function' ? 日志 : () => {}
     this.工作区 = 工作区
+    this.#已归档 = typeof 已归档 === 'function' ? 已归档 : () => false
+    this.#登记 = typeof 登记 === 'function' ? 登记 : null
+  }
+
+  /** 这条会话是不是已经被归档（侧栏看不到、不该再续）。 */
+  归档了(sessionId) {
+    return Boolean(this.#已归档(sessionId))
   }
 
   /** 这句聊天现在有没有一间房（不建）。 */
@@ -96,7 +105,9 @@ export class 房间管理器 {
         键,
         类型: 拆 ? 拆.类型 : '?',
         号码: 拆 ? 拆.号码 : '?',
+        昵称: String(行.昵称 || ''),
         sessionId: 行.sessionId,
+        归档: Boolean(this.#已归档(行.sessionId)),
         活着: Boolean(活),
         createdAt: Number(行.createdAt || 0),
         lastAt: Number(行.lastAt || 0),
@@ -126,16 +137,33 @@ export class 房间管理器 {
       const 复用 = await this.#复用(键, 行.sessionId, 模型 || 配置.模型)
       if (复用) {
         this.#触达(键)
+        this.#登记会话(复用.sessionId, 配置)
         return 复用
       }
       this.#日志(`房间 ${键} 的会话 ${行.sessionId} 续不上，重建`)
     }
 
-    return await this.#新建(键, { 昵称, 模型: 模型 || 配置.模型 })
+    const 新建 = await this.#新建(键, { 昵称, 模型: 模型 || 配置.模型 })
+    this.#登记会话(新建.sessionId, this.#读())
+    return 新建
   }
 
-  /** 已有 sessionId：活着的直接用，否则 resume。失败返回 null。 */
+  /** 把会话登记进「房间工作区」对应的 workspace，侧栏就会归到那里（失败不影响建房）。 */
+  #登记会话(sessionId, 配置) {
+    if (typeof this.#登记 !== 'function') return
+    try {
+      void Promise.resolve(this.#登记(sessionId, 房间工作区(配置, this.#家目录))).catch(() => {})
+    } catch {
+      /* 登记失败忽略 */
+    }
+  }
+
+  /** 已有 sessionId：活着的直接用，否则 resume。归档过的一律重建。失败返回 null。 */
   async #复用(键, sessionId, 模型) {
+    if (this.#已归档(sessionId)) {
+      this.#日志(`房间 ${键} 的会话 ${sessionId} 已归档（侧栏不显示），重建`)
+      return null
+    }
     const 活 = 找agent(this.#agents, sessionId)
     if (活) {
       this.#句柄.set(键, 活)
