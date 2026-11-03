@@ -1,6 +1,6 @@
 {
   "name": "dsh-qq-rooms",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "QQ 与 DSH 双向互通：聊天即房间，不用手动绑定会话；主人一个号管审批与群接入。",
   "type": "module",
   "main": "src/host.js",
