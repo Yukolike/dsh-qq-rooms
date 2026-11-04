@@ -20,6 +20,9 @@ import {
   OneBot, 解析消息, 抠QQ标记, 抠正文图, 按段拆, 提取正文, 提取图块,
   取图字节, 看图类, 存图, 转写语音,
 } from './transport.js'
+import { 合成语音, 判断发语音 } from './voice.js'
+import { 生成图片, 洗生图提示, 选尺寸 } from './image.js'
+import { 引擎们 } from './tts.js'
 
 export const name = 'qq-rooms'
 export const inject = ['agents', 'sessions', 'webServer', 'timer', 'workspaceRegistry', 'attachments']
@@ -45,6 +48,7 @@ export function apply(ctx) {
   const 家目录 = process.env.DSH_HOME || join(homedir(), '.dsh')
   const 收图目录 = join(家目录, 'qq-rooms-inbox')
   const 状态文件 = join(家目录, 'qq-rooms-state.json')
+  const 生图用量文件 = join(家目录, 'qq-rooms-image-usage.json')
   const 日志目录 = join(家目录, 'qq-rooms-logs')
   const 日志文件 = join(日志目录, 'plugin.log')
 
@@ -81,6 +85,7 @@ export function apply(ctx) {
   const 已发轮 = new Set() // 键:轮号
   const 已转消息 = new Set()
   const 上次时间 = new Map()
+  const 房间语音模式 = new Map() // 键 -> 'all' | 'off'（这间房之后的语音偏好）
   const 唤醒 = new Map() // 键 -> 时间戳
   const 待批 = new Map() // 号 -> { 时, 昵称, 文字, 条 }
   const 己方消息 = new Set() // 自己发出去的 message_id —— 群里「引用我」靠它对上
@@ -220,6 +225,11 @@ export function apply(ctx) {
         for (const [k, v] of Object.entries(j.上次)) 上次时间.set(String(k), Number(v) || 0)
       }
       if (j && Array.isArray(j.已转)) for (const id of j.已转.slice(-300)) 已转消息.add(String(id))
+      if (j && j.语音模式 && typeof j.语音模式 === 'object') {
+        for (const [k, v] of Object.entries(j.语音模式)) {
+          if (v === 'all' || v === 'off') 房间语音模式.set(String(k), v)
+        }
+      }
     } catch {
       /* 第一次跑 */
     }
@@ -230,7 +240,11 @@ export function apply(ctx) {
       mkdirSync(家目录, { recursive: true })
       writeFileSync(
         状态文件,
-        JSON.stringify({ 上次: Object.fromEntries(上次时间), 已转: [...已转消息].slice(-300) }, null, 2),
+        JSON.stringify({
+          上次: Object.fromEntries(上次时间),
+          已转: [...已转消息].slice(-300),
+          语音模式: Object.fromEntries(房间语音模式),
+        }, null, 2),
         'utf8',
       )
     } catch {
@@ -347,12 +361,33 @@ export function apply(ctx) {
 
   /* ---------------- 发送 ---------------- */
 
-  /** 真的发出去：不看总开关 / 试运行（「发送」和「测试一句」共用）。返回结果数组。 */
-  async function 裸发(配置, 键, 段们, 图数据) {
+  /**
+   * 真的发出去：不看总开关 / 试运行（「发送」和「测试」共用）。返回结果数组。
+   * 选项.语音 = true 时先合成语音；成功就发语音条，失败自动退回文字。
+   */
+  async function 裸发(配置, 键, 段们, 图数据, 选项 = {}) {
     const 拆 = 拆聊天键(键)
     if (!拆) return []
     const 传 = 传输(配置)
     const 结果 = []
+    const 念 = String(选项.语音文字 || '').trim()
+    let 发了语音 = false
+    if (选项.语音 && 念) {
+      const 合成 = await 合成语音(念, { 配置, 家目录 })
+      if (合成.ok) {
+        const 语音结果 = await 传.发语音(拆.类型, 拆.号码, 合成.文件)
+        结果.push(...语音结果.map((r) => ({ ...r, 语音: true })))
+        if (语音结果.length && 语音结果.every((r) => r.ok)) {
+          发了语音 = true
+          // 念的时候截断了就别把后半段吞掉；「附带文字」开着也照发。
+          if (!配置.语音附带文字 && !合成.截断) 段们 = []
+        } else {
+          记账('语音发出去了但后端回了失败 —— 这一条再补发文字')
+        }
+      } else {
+        记账('语音合成失败：' + 合成.错 + ' —— 这一条改发文字')
+      }
+    }
     if (段们.length) 结果.push(...(await 传.发文字(拆.类型, 拆.号码, 段们, { 间隔毫秒: 配置.拆段间隔毫秒 })))
     if (图数据.length) 结果.push(...(await 传.发图片(拆.类型, 拆.号码, 图数据, { 间隔毫秒: 配置.拆段间隔毫秒 })))
     // 记住自己发出去的 message_id —— 群里「引用我」就是靠它认出来的
@@ -361,22 +396,23 @@ export function apply(ctx) {
       if (id !== undefined && id !== null) 记己方消息(id)
     }
     const 好 = 结果.length > 0 && 结果.every((r) => r.ok)
-    记账(`${好 ? '✅ 已发到' : '⚠ 发送有问题'} ${键}：「${String(段们[0] || '').slice(0, 50)}」${图数据.length ? `（含 ${图数据.length} 张图）` : ''}`)
+    const 首句 = String((段们[0] || 念 || '')).slice(0, 50)
+    记账(`${好 ? '✅ 已发到' : '⚠ 发送有问题'} ${键}${发了语音 ? '（语音）' : ''}：「${首句}」${图数据.length ? `（含 ${图数据.length} 张图）` : ''}`)
     for (const r of 结果) if (!r.ok) 记账('   ' + r.action + ' 失败：' + JSON.stringify(r.数据).slice(0, 140))
     return 结果
   }
 
   /** 带闸的发送：总开关 + 试运行。返回结果数组（试运行/关闸 → 空数组）。 */
-  async function 发送(配置, 键, 段们, 图数据) {
+  async function 发送(配置, 键, 段们, 图数据, 选项 = {}) {
     if (!配置.总开关) {
       记账('总开关关着，这条没发')
       return []
     }
     if (配置.试运行) {
-      记账(`试运行：本来要发到 ${键} →「${String(段们[0] || '').slice(0, 40)}」${图数据.length ? `（还有 ${图数据.length} 张图）` : ''}`)
+      记账(`试运行：本来要发到 ${键}${选项.语音 ? '（语音）' : ''} →「${String(段们[0] || 选项.语音文字 || '').slice(0, 40)}」${图数据.length ? `（还有 ${图数据.length} 张图）` : ''}`)
       return []
     }
-    return 裸发(配置, 键, 段们, 图数据)
+    return 裸发(配置, 键, 段们, 图数据, 选项)
   }
 
   /** 私聊直发（回执、审批用）；同样受试运行约束。 */
@@ -385,10 +421,246 @@ export function apply(ctx) {
     return 发送(配置, 聊天键('私聊', 号码), 段们, [])
   }
 
-  /** 私聊直发，不看总开关和试运行 —— 只有设置页的「测试一句」用它。 */
-  async function 私聊裸发(配置, 号码, 文字) {
+  /** 私聊直发，不看总开关和试运行 —— 只有设置页的「测试」用它。 */
+  async function 私聊裸发(配置, 号码, 文字, 选项 = {}) {
     const 段们 = 配置.长回复拆段 ? 按段拆(文字) : [String(文字 || '').trim()].filter(Boolean)
-    return 裸发(配置, 聊天键('私聊', 号码), 段们, [])
+    return 裸发(配置, 聊天键('私聊', 号码), 段们, [], 选项)
+  }
+
+  /* ---------------- 语音工具（主人私聊） ---------------- */
+
+  /** 给主人的私聊挂上 qq_voice：用户说“发条语音”时直接合成一条。 */
+  function 挂语音工具(agent, 键) {
+    if (!agent || !agent.ctx || !agent.ctx.tools || typeof agent.ctx.tools.register !== 'function') return
+    if (已挂语音.has(agent)) return
+    已挂语音.add(agent)
+    try {
+      agent.ctx.tools.register({
+        name: 'qq_voice',
+        description: '把一句话合成语音发到当前 QQ 聊天。用户说“发条语音 / 用语音说 / 念出来”时调用。text 里可以少量加 (laughs)/(sighs)/(breath)/(emm)，最多一个。调用后回复里不要再写 [语音]，也不用重复这句话。',
+        parameters: {
+          type: 'object',
+          properties: {
+            text: { type: 'string', description: '要念的内容（中文即可）' },
+          },
+          required: ['text'],
+          additionalProperties: false,
+        },
+        output: {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, 说: { type: 'string' } },
+            additionalProperties: true,
+          },
+          render: (_参数, 值) => [{ type: 'text', text: String((值 && 值.说) || '') }],
+        },
+        execute: async (参数 = {}) => 开说(键, 参数),
+      })
+      记账(`语音工具已挂上：${键}`)
+    } catch (error) {
+      记账('语音工具挂不上：' + String((error && error.message) || error))
+    }
+  }
+
+  const 有效语音模式 = (配置, 键) => 房间语音模式.get(键) || 配置.语音模式
+
+  /** 兜底：主人明确说「接下来都用语音」时，不依赖模型一定要调工具。 */
+  function 识别语音偏好(文字) {
+    const t = String(文字 || '').trim().replace(/[。！!，,]+$/u, '')
+    if (!t || t.length > 40) return ''
+    if (/(?:别|不要|不用|停止|关掉|关了).{0,4}语音/u.test(t)) return 'off'
+    if (/^(?:都|全都|一直|全程|接下来|以后|之后|下面|往后).{0,8}(?:语音|念)/u.test(t)) return 'all'
+    if (/^(?:请)?(?:用|发)?语音(?:回复|回|说)?$/u.test(t)) return 'all'
+    if (/^(?:都|全都|一直|全程|接下来|以后|之后|下面|往后).{0,8}(?:文字|打字)/u.test(t)) return 'off'
+    if (/^(?:请)?(?:用|发|改|换)?文字(?:回复|回)?$/u.test(t)) return 'off'
+    if (/^(?:恢复|回到)(?:自动|默认)$/u.test(t) || /^你自己判断$/u.test(t)) return 'auto'
+    return ''
+  }
+
+  /** 记住「这间房之后都用语音 / 都用文字」。 */
+  function 挂语音模式工具(agent, 键) {
+    if (!agent || !agent.ctx || !agent.ctx.tools || typeof agent.ctx.tools.register !== 'function') return
+    if (已挂语音模式.has(agent)) return
+    已挂语音模式.add(agent)
+    try {
+      agent.ctx.tools.register({
+        name: 'qq_voice_mode',
+        description: '记住当前 QQ 房间之后的语音偏好。用户说“接下来都用语音 / 都用语音回复”时 mode=voice；说“用文字 / 别用语音”时 mode=text；说“恢复自动 / 你自己判断”时 mode=auto。只对主人私聊有效。',
+        parameters: {
+          type: 'object',
+          properties: {
+            mode: {
+              type: 'string',
+              enum: ['voice', 'text', 'auto'],
+              description: 'voice = 之后都用语音；text = 之后都用文字；auto = 恢复全局设置',
+            },
+          },
+          required: ['mode'],
+          additionalProperties: false,
+        },
+        output: {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, 说: { type: 'string' } },
+            additionalProperties: true,
+          },
+          render: (_参数, 值) => [{ type: 'text', text: String((值 && 值.说) || '') }],
+        },
+        execute: async (参数 = {}) => 设房间语音(键, 参数),
+      })
+      记账(`语音偏好工具已挂上：${键}`)
+    } catch (error) {
+      记账('语音偏好工具挂不上：' + String((error && error.message) || error))
+    }
+  }
+
+  async function 设房间语音(键, 参数 = {}) {
+    const 配置 = 读()
+    const 拆 = 拆聊天键(键)
+    if (!拆 || 拆.类型 !== '私聊' || 拆.号码 !== String(配置.主人)) {
+      return { ok: false, 说: '语音偏好只给主人私聊设置' }
+    }
+    const mode = String(参数.mode || '')
+    if (mode === 'voice') 房间语音模式.set(键, 'all')
+    else if (mode === 'text') 房间语音模式.set(键, 'off')
+    else if (mode === 'auto') 房间语音模式.delete(键)
+    else return { ok: false, 说: 'mode 只能是 voice / text / auto' }
+    存水位()
+    记账(`语音偏好已设为 ${mode === 'voice' ? '都用语音' : mode === 'text' ? '都用文字' : '跟随全局'}：${键}`)
+    return {
+      ok: true,
+      说: mode === 'voice' ? '记住了：这间房之后都用语音' : mode === 'text' ? '记住了：这间房之后都用文字' : '记住了：恢复全局语音设置',
+    }
+  }
+
+  async function 开说(键, 参数 = {}) {
+    const 配置 = 读()
+    const 拆 = 拆聊天键(键)
+    if (!拆 || 拆.类型 !== '私聊' || 拆.号码 !== String(配置.主人)) {
+      return { ok: false, 说: '语音只给主人私聊用' }
+    }
+    if (!配置.总开关) return { ok: false, 说: '总开关关着，不发' }
+    if (配置.试运行) return { ok: false, 说: '试运行中，不真的发' }
+    if (有效语音模式(配置, 键) === 'all') {
+      return { ok: false, 说: '现在是每条都念，直接正常回复就会发语音，不用调这个工具' }
+    }
+    const 文字 = String(参数.text || '').trim()
+    if (!文字) return { ok: false, 说: '要念什么？给一句文字' }
+    const 结果 = await 发送(配置, 键, [], [], { 语音: true, 语音文字: 文字 })
+    const 好 = 结果.some((r) => r.ok && r.语音)
+    if (好) 工具发语音.set(键, Date.now())
+    return { ok: 好, 说: 好 ? '语音发了，回复里不用再重复这句话' : '语音没发出去（看日志）' }
+  }
+
+  /* ---------------- 生图（主人私聊） ---------------- */
+
+  const 今天 = () => {
+    const d = new Date()
+    const 补 = (n) => String(n).padStart(2, '0')
+    return `${d.getFullYear()}-${补(d.getMonth() + 1)}-${补(d.getDate())}`
+  }
+
+  function 读生图用量() {
+    try {
+      const j = JSON.parse(readFileSync(生图用量文件, 'utf8'))
+      return j && j.日期 === 今天() ? Math.max(0, Number(j.次数) || 0) : 0
+    } catch {
+      return 0
+    }
+  }
+
+  function 加生图用量() {
+    try {
+      writeFileSync(生图用量文件, JSON.stringify({ 日期: 今天(), 次数: 读生图用量() + 1 }), 'utf8')
+    } catch {
+      /* 记不上也不影响画图 */
+    }
+  }
+
+  /** 给主人的私聊挂上 qq_draw（每间房只挂一次）。 */
+  function 挂生图工具(agent, 键, 配置) {
+    if (!配置.生图) return
+    if (!agent || !agent.ctx || !agent.ctx.tools || typeof agent.ctx.tools.register !== 'function') return
+    if (已挂生图.has(agent)) return
+    已挂生图.add(agent)
+    try {
+      agent.ctx.tools.register({
+        name: 'qq_draw',
+        description: '让 MiniMax 画一张图并发到当前 QQ 聊天。用户说“画一张 / 来张图 / 生成图片”时调用。prompt 写清楚画面；aspect_ratio 可选。',
+        parameters: {
+          type: 'object',
+          properties: {
+            prompt: { type: 'string', description: '画面描述（中文即可）' },
+            aspect_ratio: {
+              type: 'string',
+              enum: ['1:1', '16:9', '4:3', '3:2', '2:3', '3:4', '9:16', '21:9'],
+              description: '图片比例；不填就用设置里的默认值',
+            },
+          },
+          required: ['prompt'],
+          additionalProperties: false,
+        },
+        output: {
+          schema: {
+            type: 'object',
+            properties: { ok: { type: 'boolean' }, 说: { type: 'string' } },
+            additionalProperties: true,
+          },
+          render: (_参数, 值) => [{ type: 'text', text: String((值 && 值.说) || '') }],
+        },
+        execute: async (参数 = {}) => 开画(键, 参数),
+      })
+      记账(`生图工具已挂上：${键}`)
+    } catch (error) {
+      记账('生图工具挂不上：' + String((error && error.message) || error))
+    }
+  }
+
+  async function 开画(键, 参数 = {}) {
+    const 配置 = 读()
+    const 拆 = 拆聊天键(键)
+    if (!拆 || 拆.类型 !== '私聊' || 拆.号码 !== String(配置.主人)) {
+      return { ok: false, 说: '生图只给主人私聊用' }
+    }
+    if (!配置.生图) return { ok: false, 说: '生图没开（设置 → 通到 QQ → 总览）' }
+    if (!配置.总开关) return { ok: false, 说: '总开关关着，不画' }
+    if (配置.试运行) return { ok: false, 说: '试运行中，不真的画' }
+    if (!配置.发图) return { ok: false, 说: '「发图」关着，画了也发不出去' }
+
+    const 提示 = 洗生图提示((配置.生图提示前缀 || '') + String(参数.prompt || ''))
+    if (!提示) return { ok: false, 说: '要画什么？给一句画面描述' }
+    const 上限 = Number(配置.生图每日上限) || 0
+    if (上限 > 0 && 读生图用量() >= 上限) {
+      return { ok: false, 说: `今天的生图次数用完了（${上限} 张）` }
+    }
+    if (生图中.has(键)) return { ok: false, 说: '上一张还在画，等它出来' }
+
+    生图中.add(键)
+    const 尺寸 = 选尺寸(参数.aspect_ratio || 配置.生图尺寸)
+    const 画配置 = { ...配置, 生图尺寸: 尺寸 }
+    void (async () => {
+      try {
+        记账(`🎨 开始生图（${键}，${尺寸}）：${提示.slice(0, 60)}`)
+        const 图 = await 生成图片(提示, { 配置: 画配置, 家目录 })
+        if (!图.ok) {
+          记账('生图失败：' + 图.错)
+          await 发送(读(), 键, [`图没画出来：${图.错}`], [])
+          return
+        }
+        加生图用量()
+        const b64 = readFileSync(图.文件).toString('base64')
+        const 结果 = await 发送(读(), 键, [], [{ b64 }])
+        const 好 = 结果.length > 0 && 结果.every((r) => r.ok)
+        记账(`${好 ? '✅ 生图已发' : '⚠ 生图发送有问题'} ${键}（${Math.round(图.字节 / 1024)}KB）`)
+        if (!好 && 结果.length) await 发送(读(), 键, ['图画好了，但发到 QQ 失败了（看日志）'], [])
+      } catch (error) {
+        记账('生图异常：' + String((error && error.message) || error))
+        await 发送(读(), 键, ['生图出错了：' + String((error && error.message) || error)], [])
+      } finally {
+        生图中.delete(键)
+      }
+    })()
+    return { ok: true, 说: '开始画了，画好会直接发到这边；不用再回复。' }
   }
 
   /* ---------------- 出站 ---------------- */
@@ -417,13 +689,19 @@ export function apply(ctx) {
     if (!标记.发) return 记账('这一轮没写 [QQ] 块（「只发标记内」开着）—— 不往 QQ 发')
     if (标记.原因) 记账(标记.原因)
 
-    const 抠过 = 配置.发图 ? 抠正文图(标记.文字) : { 净文字: 标记.文字, 图: [] }
-    const 段们 = 配置.长回复拆段
-      ? 按段拆(抠过.净文字)
-      : [String(抠过.净文字 || '').trim()].filter(Boolean)
+    const 语音判 = 判断发语音({ ...配置, 语音模式: 有效语音模式(配置, 键) }, 标记.文字)
+    const 工具发过 = 工具发语音.get(键) || 0
+    if (工具发过) {
+      工具发语音.delete(键)
+      if (Date.now() - 工具发过 < 2 * 60 * 1000) 语音判.定 = false
+    }
+    const 抠过 = 配置.发图 ? 抠正文图(语音判.文字) : { 净文字: 语音判.文字, 图: [] }
+    const 净文字 = String(抠过.净文字 || '').trim()
+    const 段们 = 配置.长回复拆段 ? 按段拆(净文字) : [净文字].filter(Boolean)
     const 图数据 = 配置.发图 ? 出站图片(配置, 图块们, 抠过.图) : []
     if (!段们.length && !图数据.length) return 记账('这一轮既没文字也没图，不发')
-    await 发送(配置, 键, 段们, 图数据)
+    const 选项 = 语音判.定 && 净文字 ? { 语音: true, 语音文字: 净文字 } : {}
+    await 发送(配置, 键, 段们, 图数据, 选项)
   }
 
   function 收到事件(session, event) {
@@ -472,6 +750,9 @@ export function apply(ctx) {
       if (完成 && 上.轮号 === d.turn && 有东西 && !已发轮.has(轮标)) {
         已发轮.add(轮标)
         void 落地一发(配置, 键, 上.文本, 上.图们)
+        // 落地一发 在第一个 await 前已经读过这个标记；这里兜底清掉，
+        // 避免「这一轮只调了 qq_voice、最终没文字」时压住下一轮的随机语音。
+        工具发语音.delete(键)
       }
       记({ 轮号: -1, 文本: '', 图们: [] })
     }
@@ -483,6 +764,14 @@ export function apply(ctx) {
   const 已限工具 = new Map()
   /** 房间键 -> 活着的 agent：保存设置时用它立刻套用，不用等下一句。 */
   const 键agent = new Map()
+  /** 生图 / 语音工具每间房只挂一次（agent 对象身份）。 */
+  const 已挂生图 = new WeakSet()
+  const 已挂语音 = new WeakSet()
+  const 已挂语音模式 = new WeakSet()
+  /** 同一间房同时只画一张。 */
+  const 生图中 = new Set()
+  /** 这一轮已经用 qq_voice 发过语音：自动语音就别再发一遍。 */
+  const 工具发语音 = new Map()
 
   /**
    * 访客房间的工具闸门。
@@ -596,6 +885,27 @@ export function apply(ctx) {
 
   const 昵称 = (条) => String((条.sender && (条.sender.card ||条.sender.nickname)) || '')
 
+  /** 当前房间和对方是谁；只在新房/身份变化时注入一次。 */
+  function 身份上下文(配置, 键, 条) {
+    const 拆 = 拆聊天键(键)
+    if (!拆) return ''
+    const 发送者 = String(条.user_id || 拆.号码 || '')
+    const 名 = 昵称(条) || String((配置.房间 || {})[键]?.昵称 || '')
+    if (拆.类型 === '私聊') {
+      const 是主人 = 拆.号码 === String(配置.主人)
+      const 是访客 = Boolean(配置.访客 && 配置.访客[拆.号码])
+      const 关系 = 是主人 ? '主人（管理员）' : 是访客 ? '已批准的访客' : '普通私聊对象'
+      return `（QQ 私聊房间。对方 QQ：${拆.号码}；昵称：${名 || '未知'}；关系：${关系}。这段是身份信息，不用向对方复述。）`
+    }
+    const 群 = (配置.群 || {})[拆.号码] || {}
+    const 成员 = 群.members || {}
+    const 是主人 = 发送者 === String(配置.主人)
+    const 是白名单 = Array.isArray(成员.allow) && 成员.allow.includes(发送者)
+    const 关系 = 是主人 ? '主人（管理员）' : 是白名单 ? '群白名单成员' : '普通群成员'
+    const 群名 = 群.名称 || '未知群'
+    return `（QQ 群聊房间。群：${群名}（${拆.号码}）；当前发言者：${名 || '未知'}（QQ ${发送者}）；关系：${关系}。这段是身份信息，不用向对方复述。）`
+  }
+
   /** 新房间的人格设定：从房间工作区的 AGENTS.md 读（agents.create 不会自动注入）。 */
   function 读人格(配置) {
     try {
@@ -612,17 +922,30 @@ export function apply(ctx) {
     const 拆 = 拆聊天键(键)
     // 房间是私聊就把对方昵称记到配置里，设置页直接显示（群名走启动补昵称）
     if (拆 && 拆.类型 === '私聊') 记昵称(键, 昵称(条))
+    if (拆 && 拆.类型 === '私聊' && 拆.号码 === String(配置.主人)) {
+      挂语音工具(房.agent, 键)
+      挂语音模式工具(房.agent, 键)
+      挂生图工具(房.agent, 键, 配置)
+    }
     // 除了「主人的私聊」，所有房间都上闸门：群成员不可信，群房默认全禁；档位改了当场换
     const 是主人私聊 = 拆 && 拆.类型 === '私聊' && 拆.号码 === String(配置.主人)
+    if (是主人私聊) {
+      const 偏好 = 识别语音偏好(文字)
+      if (偏好 === 'all') 房间语音模式.set(键, 'all')
+      else if (偏好 === 'off') 房间语音模式.set(键, 'off')
+      else if (偏好 === 'auto') 房间语音模式.delete(键)
+      if (偏好) {
+        存水位()
+        记账(`语音偏好：${偏好 === 'all' ? '都用语音' : 偏好 === 'off' ? '都用文字' : '跟随全局'}（按消息识别）`)
+      }
+    }
     if (!是主人私聊) {
       键agent.set(键, 房.agent)
       限制访客工具(房.agent, 房间策略(配置, 键))
     }
 
     const 收下 = await 收图(配置, 图们, 条.message_id)
-    const 署名 = 类型 === '群'
-      ? (昵称(条) || '某人') + '（' + 发送者 + '）：'
-      : ''
+    const 署名 = (昵称(条) || '某人') + '（' + 发送者 + '）：'
     const 图说明 = 收下.length
       ? '\n（' + (类型 === '群' ? '发来' : '你发来') + ` ${收下.length} 张图：`
         + 收下.map((x, i) => `第${i + 1}张 ${Math.round(x.字节 / 1024)}KB` + (x.存 ? `，要发回去用 ${x.存}` : '')).join('；')
@@ -637,10 +960,27 @@ export function apply(ctx) {
       return false
     }
 
+    // 身份注入：新房 / 昵称或关系变了时，告诉模型“这是谁”
+    const 身份 = 身份上下文(配置, 键, 条)
+    const 身份哈希 = 身份 ? createHash('sha1').update(身份).digest('hex').slice(0, 12) : ''
+    const 房记录 = (配置.房间 || {})[键] || {}
+    const 要注入身份 = Boolean(身份) && (房.created || 房记录.identityHash !== 身份哈希)
+    const 身份块 = 要注入身份
+      ? '（下面是当前房间和对方身份，按这个理解谁在说话；不用向对方解释这段。）\n\n' + 身份 + '\n\n----\n\n'
+      : ''
+    if (要注入身份) {
+      改((旧) => {
+        const 行们 = { ...(旧.房间 || {}) }
+        const 现行 = 行们[键] || { sessionId: 房.sessionId, createdAt: Date.now(), lastAt: Date.now() }
+        行们[键] = { ...现行, identityHash: 身份哈希 }
+        return { ...旧, 房间: 行们 }
+      })
+      记账(`身份已注入到 ${键}：${身份}`)
+    }
+
     // 人格注入：新房必注入；老房只在人格文件内容变了时重新注入一次
     const 人设文本 = 读人格(配置)
     const 人设哈希 = 人设文本 ? createHash('sha1').update(人设文本).digest('hex').slice(0, 12) : ''
-    const 房记录 = (配置.房间 || {})[键] || {}
     const 要注入 = Boolean(人设文本) && (房.created || 房记录.personaHash !== 人设哈希)
     const 人设 = 要注入 ? 人设文本 : ''
     const 人生块 = 人设
@@ -657,7 +997,7 @@ export function apply(ctx) {
       })
       if (!房.created) 记账(`人格已更新，注入到 ${键}`)
     }
-    let content = [{ type: 'text', text: 人生块 + 正文 + 块提示 }]
+    let content = [{ type: 'text', text: 身份块 + 人生块 + 正文 + 块提示 }]
     const 附件 = 服务('attachments')
     if (收下.length && 附件 && typeof 附件.admitPromptContent === 'function') {
       try {
@@ -672,7 +1012,7 @@ export function apply(ctx) {
         ])
       } catch (error) {
         记账('图交给 DSH 没成功（这轮只转文字）：' + String((error && error.message) || error))
-        content = [{ type: 'text', text: 正文 + 块提示 }]
+        content = [{ type: 'text', text: 身份块 + 人生块 + 正文 + 块提示 }]
       }
     }
 
@@ -1153,6 +1493,14 @@ export function apply(ctx) {
       冲突,
       原版状态,
       配置: 遮令牌(配置),
+      语音: {
+        引擎: 配置.语音引擎,
+        引擎们: Object.fromEntries(Object.entries(引擎们).map(([id, e]) => [id, {
+          id, label: e.label, defaultVoice: e.defaultVoice,
+          emotions: e.emotions, supportsTags: e.supportsTags,
+          needsKey: e.needsKey, voices: e.voices,
+        }])),
+      },
       房间: 房间.列表(),
       待批: [...待批.entries()].map(([号, v]) => ({ 号, 昵称: v.昵称, 文字: String(v.文字 || '').slice(0, 120), 时: v.时 })),
       日志,
@@ -1246,6 +1594,16 @@ export function apply(ctx) {
     // 手动测试是**真发**：总开关和试运行都绕过（否则测试永远测不出通不通）
     const 结果 = await 私聊裸发(配置, 配置.主人, '（这是一条测试消息：DSH → QQ 通了）')
     回(res, { ok: 结果.length > 0 && 结果.every((r) => r.ok), 说: 结果.length ? '已发' : '没发（看日志）', 日志 })
+  })
+
+  路线(`${路由前缀}/test-voice`, async (req, res) => {
+    const 配置 = 读()
+    if (!配置.主人) return 回(res, { ok: false, 说: '先设置主人 QQ 号' })
+    const 话 = '（语音测试：DSH 到 QQ 的语音通了）'
+    const 结果 = await 私聊裸发(配置, 配置.主人, 话, { 语音: true, 语音文字: 话 })
+    const 语音 = 结果.some((r) => r.ok && r.语音)
+    const 好 = 结果.length > 0 && 结果.every((r) => r.ok)
+    回(res, { ok: 好, 说: 语音 ? '已发语音（看 QQ）' : 好 ? '只发出了文字（合成失败，看日志）' : '没发出去（看日志）', 日志 })
   })
 
   路线(`${路由前缀}/approve`, async (req, res) => {

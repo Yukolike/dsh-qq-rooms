@@ -7,6 +7,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { 引擎们, 引擎ids, 默认引擎配置, 解析旧命令 } from './tts.js'
 
 export const 配置文件名 = 'qq-rooms-config.json'
 
@@ -52,10 +53,31 @@ export const 默认配置 = Object.freeze({
   语音转写: false,
   转写命令: '',
   转写超时秒: 60,
+  语音模式: 'off',                // 发语音：off / all / mark / random
+  语音概率: 20,                   // random 模式下每条回复发语音的概率（0–100）
+  语音引擎: 'minimax',             // minimax / edge / sapi / custom
+  引擎配置: {},                   // 每个引擎自己的模型/语速/音高/key 引用
+  引擎音色: {},                   // 每个引擎上次选的音色
+  语音合成命令: '',               // 高级覆盖：非空时优先，排错/自定义用
+  语音音色: '',                   // 当前引擎的音色
+  语音情绪: '',                   // 空 = 模型自动判断；happy / calm / sad / angry ...
+  语音最长字: 200,                // 超过就截断（10–2000）
+  语音超时秒: 45,                 // 合成命令超时
+  语音附带文字: false,            // 开 = 语音条之外再发一遍文字
+  生图: false,                    // 主人私聊里让机器人画图（MiniMax image-01）
+  生图模型: 'image-01',            // image-01 / image-01-live
+  生图尺寸: '1:1',                 // 1:1 / 16:9 / 9:16 / 4:3 / 3:4 ...
+  生图提示前缀: '',                // 每条提示词前面自动加的固定画风
+  生图每日上限: 10,                // 0 = 不限制
+  生图超时秒: 180,                 // 出图最长等多久
   群里听名字: false,              // 群里按「名字」算点名（默认关，误伤率高）
 })
 
 const 群模式 = new Set(['mention', 'all'])
+const 语音模式们 = new Set(['off', 'all', 'mark', 'random'])
+const 情绪们 = new Set(['', 'happy', 'sad', 'angry', 'fearful', 'disgusted', 'surprised', 'calm', 'fluent', 'whisper'])
+const 生图模型们 = new Set(['image-01', 'image-01-live'])
+const 生图尺寸们 = new Set(['1:1', '16:9', '4:3', '3:2', '2:3', '3:4', '9:16', '21:9'])
 /** 访客 / 每房工具档。 */
 const 工具档 = new Set(['none', 'safe', 'standard'])
 
@@ -77,6 +99,11 @@ const 数 = (v, 兜, 低, 高) => {
   const n = Number(v)
   if (!Number.isFinite(n)) return 兜
   return Math.max(低, Math.min(Math.round(n), 高))
+}
+const 小数 = (v, 兜, 低, 高) => {
+  const n = Number(v)
+  if (!Number.isFinite(n)) return 兜
+  return Math.max(低, Math.min(n, 高))
 }
 const 号码 = (v) => (/^\d{4,12}$/.test(String(v || '').trim()) ? String(v).trim() : '')
 
@@ -157,14 +184,81 @@ export function 规整房间(raw) {
       createdAt: Number((v && v.createdAt) || 0),
       lastAt: Number((v && v.lastAt) || 0),
       personaHash: 字(v && v.personaHash).slice(0, 32),
+      identityHash: 字(v && v.identityHash).slice(0, 32),
     }
   }
+  return 出
+}
+
+/** 当前引擎：显式值优先；旧配置按旧命令猜一次。 */
+function 选引擎(混) {
+  const 来 = 字(混.语音引擎)
+  if (引擎ids.includes(来)) return 来
+  const 旧 = 字(混.语音合成命令)
+  if (/tts_minimax\.py/u.test(旧)) return 'minimax'
+  if (/edge_tts/u.test(旧)) return 'edge'
+  if (!旧 && /^(?:Microsoft|Huihui|Zira)/u.test(字(混.语音音色))) return 'sapi'
+  if (旧) return 'custom'
+  return 'minimax'
+}
+
+function 规整引擎配置(raw, 引擎, 旧命令) {
+  const 出 = {}
+  for (const id of 引擎ids) {
+    const 默认 = 默认引擎配置[id] || {}
+    const 来 = 是对象(raw && raw[id]) ? raw[id] : {}
+    const 配 = { ...默认 }
+    if (id === 'minimax') {
+      if (来.model) 配.model = 字(来.model).slice(0, 40)
+      if (来.speed !== undefined) 配.speed = 小数(来.speed, 配.speed, 0.5, 2)
+      if (来.pitch !== undefined) 配.pitch = Math.round(数(来.pitch, 配.pitch, -12, 12))
+    } else if (id === 'edge') {
+      if (来.rate) 配.rate = 字(来.rate).slice(0, 20)
+      if (来.pitch) 配.pitch = 字(来.pitch).slice(0, 20)
+    } else if (id === 'custom') {
+      配.命令 = 字(来.命令)
+    }
+    if ((id === 'minimax' || id === 'edge') && 来.python) 配.python = 字(来.python).slice(0, 300)
+    出[id] = 配
+  }
+
+  // 旧配置只有命令：把 python / model / speed / pitch 迁进当前引擎。
+  const 旧 = 解析旧命令(旧命令)
+  const 当前原 = 是对象(raw && raw[引擎]) ? raw[引擎] : null
+  if (!当前原 && 引擎 === 'minimax') {
+    if (旧.python) 出.minimax.python = 旧.python
+    if (旧.model) 出.minimax.model = 旧.model
+    if (旧.speed != null) 出.minimax.speed = 小数(旧.speed, 出.minimax.speed, 0.5, 2)
+    if (旧.pitch != null) 出.minimax.pitch = Math.round(数(旧.pitch, 出.minimax.pitch, -12, 12))
+  }
+  if (!当前原 && 引擎 === 'edge') {
+    if (旧.python) 出.edge.python = 旧.python
+    if (旧.rate) 出.edge.rate = 旧.rate
+    if (旧.edgePitch) 出.edge.pitch = 旧.edgePitch
+  }
+  return 出
+}
+
+function 规整引擎音色(raw, 引擎, 语音音色) {
+  const 出 = {}
+  for (const id of 引擎ids) {
+    const 来 = 字(raw && raw[id])
+    出[id] = 来 || (id === 引擎 ? 语音音色 : '') || 引擎们[id].defaultVoice
+  }
+  if (语音音色) 出[引擎] = 语音音色
   return 出
 }
 
 /** 一份配置 → 干净配置。未知键丢弃，数字夹取，非法条目丢弃。 */
 export function 归一化(raw) {
   const 混 = 是对象(raw) ? raw : {}
+  const 引擎 = 选引擎(混)
+  const 旧命令 = 字(混.语音合成命令)
+  const 引擎配置 = 规整引擎配置(混.引擎配置, 引擎, 旧命令)
+  const 音色 = 字(混.语音音色).slice(0, 80)
+    || 字(混.引擎音色 && 混.引擎音色[引擎]).slice(0, 80)
+    || 引擎们[引擎].defaultVoice
+  const 引擎音色 = 规整引擎音色(混.引擎音色, 引擎, 音色)
   return {
     主人: 号码(混.主人),
     主人称呼: 字(混.主人称呼).slice(0, 16) || 默认配置.主人称呼,
@@ -203,6 +297,23 @@ export function 归一化(raw) {
     语音转写: 布(混.语音转写, 默认配置.语音转写),
     转写命令: 字(混.转写命令),
     转写超时秒: 数(混.转写超时秒, 默认配置.转写超时秒, 5, 600),
+    语音模式: 语音模式们.has(字(混.语音模式)) ? 字(混.语音模式) : 默认配置.语音模式,
+    语音概率: 数(混.语音概率, 默认配置.语音概率, 0, 100),
+    语音引擎: 引擎,
+    引擎配置,
+    引擎音色,
+    语音合成命令: 旧命令,
+    语音音色: 音色,
+    语音情绪: 情绪们.has(字(混.语音情绪)) ? 字(混.语音情绪) : '',
+    语音最长字: 数(混.语音最长字, 默认配置.语音最长字, 10, 2000),
+    语音超时秒: 数(混.语音超时秒, 默认配置.语音超时秒, 5, 600),
+    语音附带文字: 布(混.语音附带文字, 默认配置.语音附带文字),
+    生图: 布(混.生图, 默认配置.生图),
+    生图模型: 生图模型们.has(字(混.生图模型)) ? 字(混.生图模型) : 默认配置.生图模型,
+    生图尺寸: 生图尺寸们.has(字(混.生图尺寸)) ? 字(混.生图尺寸) : 默认配置.生图尺寸,
+    生图提示前缀: 字(混.生图提示前缀).slice(0, 300),
+    生图每日上限: 数(混.生图每日上限, 默认配置.生图每日上限, 0, 100),
+    生图超时秒: 数(混.生图超时秒, 默认配置.生图超时秒, 30, 300),
     群里听名字: 布(混.群里听名字, 默认配置.群里听名字),
   }
 }

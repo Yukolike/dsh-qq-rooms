@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const 宿主路径 = resolve('src/host.js')
 let 序号 = 0
@@ -38,6 +38,15 @@ function 环境(配置 = {}) {
     if (u.includes('get_group_info')) {
       return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { group_id: 30001, group_name: '测试群' } }) }
     }
+    if (u.includes('/v1/image_generation')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: { image_base64: [Buffer.from([0xff, 0xd8, 0xff, 0xd9]).toString('base64')] },
+          base_resp: { status_code: 0, status_msg: 'success' },
+        }),
+      }
+    }
     if (u.includes('_msg_history')) {
       return { ok: true, json: async () => ({ status: 'ok', retcode: 0, data: { messages: [] } }) }
     }
@@ -48,6 +57,7 @@ function 环境(配置 = {}) {
   const 限制 = []
   const 守卫 = []
   const 撤销 = []
+  const 注册工具 = []
   const 事件handler = []
   const 效果 = []
   const 定时 = []
@@ -83,6 +93,10 @@ function 环境(配置 = {}) {
             撤销.push(['guard'])
           }
         },
+        register: (工具) => {
+          注册工具.push(工具)
+          return () => {}
+        },
       },
     },
   })
@@ -113,7 +127,7 @@ function 环境(配置 = {}) {
   }
 
   return {
-    家, 请求, 跟进, 限制, 守卫, 撤销, 事件handler, 效果, 定时, 路由, ctx,
+    家, 请求, 跟进, 限制, 守卫, 撤销, 注册工具, 事件handler, 效果, 定时, 路由, ctx,
     配置: () => JSON.parse(readFileSync(join(家, 'qq-rooms-config.json'), 'utf8')),
     清理: () => { globalThis.fetch = 原fetch },
   }
@@ -251,6 +265,269 @@ test('出站：turn/end completed 才发，且按房间回对应聊天', async (
     assert.equal(新发.length, 1)
     assert.equal(新发[0].body.user_id, 20001)
     assert.equal(新发[0].body.message[0].data.text, '回你的话')
+  } finally { e.清理() }
+})
+
+test('语音：all 发成 record；mark 只认 [语音]，标记不泄露', async () => {
+  const e = 环境()
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  const 命令 = `"${process.execPath}" "${脚本}" "{text}" "{out}"`
+  const 存配置 = (补) => writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({ ...e.配置(), ...补 }, null, 2), 'utf8')
+  const 等够 = () => new Promise((r) => setTimeout(r, 600))
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息())
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '同意 20001' } }] }))
+    await 等一拍()
+    const 房 = e.配置().房间['私聊:20001']
+    const 派 = e.事件handler[0]
+    const 发到房间 = () => e.请求.filter((r) => r.u.endsWith('/send_private_msg') && r.body.user_id === 20001)
+    const 一言 = (turn, 文字) => {
+      派({ id: 房.sessionId }, { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text: 文字 }] } } })
+      派({ id: 房.sessionId }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+    }
+
+    存配置({ 语音模式: 'all', 语音合成命令: 命令, 语音超时秒: 20 })
+    const 前 = 发到房间().length
+    一言(1, '念这一句')
+    await 等够()
+    const 发1 = 发到房间().slice(前)
+    assert.equal(发1.length, 1, '语音模式 all 只发一条语音')
+    assert.equal(发1[0].body.message[0].type, 'record')
+    assert.ok(existsSync(fileURLToPath(发1[0].body.message[0].data.file)), '音频文件真的生成了')
+
+    存配置({ 语音模式: 'mark' })
+    const 前2 = 发到房间().length
+    一言(2, '这条只发文字')
+    await 等够()
+    const 发2 = 发到房间().slice(前2)
+    assert.equal(发2.length, 1)
+    assert.equal(发2[0].body.message[0].type, 'text')
+    assert.equal(发2[0].body.message[0].data.text, '这条只发文字')
+
+    存配置({ 语音模式: 'mark', 语音附带文字: true })
+    const 前3 = 发到房间().length
+    一言(3, '[语音]这条要念')
+    await 等够()
+    const 发3 = 发到房间().slice(前3)
+    assert.deepEqual(发3.map((r) => r.body.message[0].type), ['record', 'text'])
+    assert.equal(发3[1].body.message[0].data.text, '这条要念', '[语音] 标记不能露到 QQ')
+
+    // 念的太长被截断 → 剩余正文仍要发出来（不能吞字）
+    存配置({ 语音模式: 'all', 语音最长字: 10, 语音附带文字: false })
+    const 前4 = 发到房间().length
+    一言(4, '这一句明显超过十个字了吧')
+    await 等够()
+    const 发4 = 发到房间().slice(前4)
+    assert.deepEqual(发4.map((r) => r.body.message[0].type), ['record', 'text'])
+    assert.equal(发4[1].body.message[0].data.text, '这一句明显超过十个字了吧')
+  } finally { e.清理() }
+})
+
+test('随机语音：概率 100 发 record，概率 0 发文字', async () => {
+  const e = 环境({ 总开关: true, 试运行: false, 主人: '10000' })
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  const 存配置 = (补) => writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({
+    ...e.配置(),
+    总开关: true,
+    试运行: false,
+    主人: '10000',
+    NapCat: 'http://synthetic.invalid',
+    事件地址: '',
+    语音模式: 'random',
+    语音概率: 100,
+    语音合成命令: `"${process.execPath}" "${脚本}" "{text}" "{out}"`,
+    语音超时秒: 20,
+    ...补,
+  }), 'utf8')
+  const 等够 = () => new Promise((r) => setTimeout(r, 500))
+  try {
+    存配置({})
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '在吗' } }] }))
+    await 等一拍()
+    const 房 = e.配置().房间['私聊:10000']
+    const 派 = (turn, 文) => {
+      const h = e.事件handler[0]
+      h({ id: 房.sessionId }, { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text: 文 }] } } })
+      h({ id: 房.sessionId }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+    }
+    const 前 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).length
+    派(1, '这条抽中了')
+    await 等够()
+    const 抽中 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).slice(前)
+    assert.equal(抽中.length, 1)
+    assert.equal(抽中[0].body.message[0].type, 'record')
+
+    存配置({ 语音概率: 0 })
+    const 前2 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).length
+    派(2, '这条没抽中')
+    await 等够()
+    const 没抽 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).slice(前2)
+    assert.equal(没抽.length, 1)
+    assert.equal(没抽[0].body.message[0].type, 'text')
+  } finally { e.清理() }
+})
+
+test('身份：私聊首条注入 QQ/关系，之后每条带 QQ 前缀', async () => {
+  const e = 环境({ 总开关: true, 试运行: false, 主人: '10000' })
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, sender: { nickname: '老大' }, message: [{ type: 'text', data: { text: '你好' } }] }))
+    await 等一拍()
+    const 首条 = JSON.stringify(e.跟进[0])
+    assert.match(首条, /QQ 私聊房间/u)
+    assert.match(首条, /对方 QQ：10000/u)
+    assert.match(首条, /关系：主人/u)
+    assert.match(首条, /老大（10000）：/u)
+
+    await api.处理消息(消息({ user_id: 10000, message_id: 3, sender: { nickname: '老大' }, message: [{ type: 'text', data: { text: '再说一句' } }] }))
+    await 等一拍()
+    const 第二条 = JSON.stringify(e.跟进[1])
+    assert.doesNotMatch(第二条, /QQ 私聊房间/u, '身份块只注入一次')
+    assert.match(第二条, /老大（10000）：/u, '每条私聊都带昵称和 QQ')
+  } finally { e.清理() }
+})
+
+test('语音偏好：qq_voice_mode 记住整间房都用语音/文字', async () => {
+  const e = 环境({ 总开关: true, 试运行: false, 主人: '10000', 语音模式: 'mark' })
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({
+    总开关: true,
+    试运行: false,
+    主人: '10000',
+    NapCat: 'http://synthetic.invalid',
+    事件地址: '',
+    语音模式: 'mark',
+    语音合成命令: `"${process.execPath}" "${脚本}" "{text}" "{out}"`,
+    语音超时秒: 20,
+  }), 'utf8')
+  const 等够 = () => new Promise((r) => setTimeout(r, 500))
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '在吗' } }] }))
+    await 等一拍()
+
+    const 工具 = e.注册工具.find((x) => x.name === 'qq_voice_mode')
+    assert.ok(工具, '主人私聊应挂 qq_voice_mode')
+    const 房 = e.配置().房间['私聊:10000']
+    const 派 = (turn, 文) => {
+      const h = e.事件handler[0]
+      h({ id: 房.sessionId }, { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text: 文 }] } } })
+      h({ id: 房.sessionId }, { type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+    }
+
+    const 开 = await 工具.execute({ mode: 'voice' })
+    assert.equal(开.ok, true)
+    const 前 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).length
+    派(1, '没有标记也应该语音')
+    await 等够()
+    const 发1 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).slice(前)
+    assert.equal(发1.length, 1)
+    assert.equal(发1[0].body.message[0].type, 'record')
+
+    const 关 = await 工具.execute({ mode: 'text' })
+    assert.equal(关.ok, true)
+    const 前2 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).length
+    派(2, '现在只发文字')
+    await 等够()
+    const 发2 = e.请求.filter((r) => r.u.endsWith('/send_private_msg')).slice(前2)
+    assert.equal(发2.length, 1)
+    assert.equal(发2[0].body.message[0].type, 'text')
+  } finally { e.清理() }
+})
+
+test('语音偏好：主人说「接下来都用语音」也能记住', async () => {
+  const e = 环境({ 总开关: true, 试运行: false, 主人: '10000', 语音模式: 'mark' })
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({
+    总开关: true,
+    试运行: false,
+    主人: '10000',
+    NapCat: 'http://synthetic.invalid',
+    事件地址: '',
+    语音模式: 'mark',
+    语音合成命令: `"${process.execPath}" "${脚本}" "{text}" "{out}"`,
+    语音超时秒: 20,
+  }), 'utf8')
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '接下来都用语音回复' } }] }))
+    await 等一拍()
+    const 房 = e.配置().房间['私聊:10000']
+    const h = e.事件handler[0]
+    h({ id: 房.sessionId }, { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '这句应该自动语音' }] } } })
+    h({ id: 房.sessionId }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+    await new Promise((r) => setTimeout(r, 500))
+    const 发 = e.请求.filter((r) => r.u.endsWith('/send_private_msg'))
+    assert.equal(发.length, 1)
+    assert.equal(发[0].body.message[0].type, 'record')
+    const 概况 = await api.概况()
+    assert.match(概况.日志.map((x) => x.文本).join('\n'), /语音偏好：都用语音/u)
+  } finally { e.清理() }
+})
+
+test('语音工具：主人私聊挂 qq_voice，调用后发 record', async () => {
+  const e = 环境({ 总开关: true, 试运行: false, 主人: '10000' })
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({
+    总开关: true,
+    试运行: false,
+    主人: '10000',
+    NapCat: 'http://synthetic.invalid',
+    事件地址: '',
+    语音合成命令: `"${process.execPath}" "${脚本}" "{text}" "{out}"`,
+    语音超时秒: 20,
+  }), 'utf8')
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '在吗' } }] }))
+    await 等一拍()
+
+    const 工具 = e.注册工具.find((x) => x.name === 'qq_voice')
+    assert.ok(工具, '主人私聊应挂 qq_voice')
+    const 回 = await 工具.execute({ text: '这条用语音说' })
+    assert.equal(回.ok, true, 回.说)
+    const 发 = e.请求.filter((r) => r.u.endsWith('/send_private_msg') && r.body.user_id === 10000)
+    assert.equal(发.length, 1)
+    assert.equal(发[0].body.message[0].type, 'record')
+  } finally { e.清理() }
+})
+
+test('生图：主人私聊挂 qq_draw，异步出图并发到 QQ', async () => {
+  const e = 环境({ 生图: true, 总开关: true, 试运行: false, 主人: '10000', 发图: true })
+  writeFileSync(join(e.家, 'minimax-api-key.txt'), 'test-key', 'utf8')
+  try {
+    const host = await 载入()
+    const api = host.apply(e.ctx)
+    await api.处理消息(消息({ user_id: 10000, message_id: 2, message: [{ type: 'text', data: { text: '在吗' } }] }))
+    await 等一拍()
+
+    const 工具 = e.注册工具.find((x) => x.name === 'qq_draw')
+    assert.ok(工具, '主人私聊应挂 qq_draw')
+    const 回 = await 工具.execute({ prompt: '一只蓝发小鲸鱼在吃大白饭' })
+    assert.equal(回.ok, true)
+    assert.match(回.说, /开始画/u)
+
+    await new Promise((r) => setTimeout(r, 500))
+    const 图 = e.请求.filter((r) => r.u.endsWith('/send_private_msg') && r.body.user_id === 10000 && r.body.message?.[0]?.type === 'image')
+    assert.equal(图.length, 1, '画好后应发一条图片')
+    assert.match(图[0].body.message[0].data.file, /^base64:\/\//u)
+    const 概况 = await api.概况()
+    const 日志 = 概况.日志.map((x) => x.文本).join('\n')
+    assert.match(日志, /开始生图/u)
+    assert.match(日志, /生图已发/u)
   } finally { e.清理() }
 })
 
@@ -886,6 +1163,32 @@ test('测试一句：绕过总开关和试运行，真发一条给主人', async
     assert.equal(发.length, 1, '手动测试要真发')
     assert.equal(发[0].body.user_id, 10000)
     assert.equal(回.ok, true)
+  } finally { e.清理() }
+})
+
+test('测试语音：绕过总开关和试运行，真发一条 record 给主人', async () => {
+  const e = 环境({ 总开关: false, 试运行: true })
+  const 脚本 = join(e.家, 'fake-tts.mjs')
+  writeFileSync(脚本, "import { writeFileSync } from 'node:fs'\nwriteFileSync(process.argv[3], Buffer.from('fake-wav'))", 'utf8')
+  writeFileSync(join(e.家, 'qq-rooms-config.json'), JSON.stringify({
+    总开关: false,
+    试运行: true,
+    主人: '10000',
+    NapCat: 'http://synthetic.invalid',
+    事件地址: '',
+    语音合成命令: `"${process.execPath}" "${脚本}" "{text}" "{out}"`,
+    语音超时秒: 20,
+  }), 'utf8')
+  try {
+    const host = await 载入()
+    host.apply(e.ctx)
+    const 回 = await 打路由(e, '/dsh-qq-rooms/test-voice')
+    const 发 = e.请求.filter((r) => r.u.endsWith('/send_private_msg'))
+    assert.equal(发.length, 1, '手动测试要真发')
+    assert.equal(发[0].body.user_id, 10000)
+    assert.equal(发[0].body.message[0].type, 'record')
+    assert.equal(回.ok, true)
+    assert.match(回.说, /语音/u)
   } finally { e.清理() }
 })
 

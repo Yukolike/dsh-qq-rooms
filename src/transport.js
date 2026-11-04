@@ -15,6 +15,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 import { join } from 'node:path'
+import { 语音段 } from './voice.js'
 
 const 睡 = (毫秒) => new Promise((r) => setTimeout(r, Math.max(0, 毫秒)))
 
@@ -563,6 +564,18 @@ export class OneBot {
       if (i < 段们.length - 1 && 间隔毫秒) await 睡(间隔毫秒)
     }
     return 出
+  }
+
+  /** 发一条语音（OneBot record 段；后端自己转 silk）。 */
+  async 发语音(类型, 号码, 文件) {
+    const 是群 = 类型 === '群'
+    const action = 是群 ? 'send_group_msg' : 'send_private_msg'
+    const 体 = {
+      [是群 ? 'group_id' : 'user_id']: Number(号码),
+      message: [语音段(文件)],
+    }
+    const r = await this.发一个(action, 体)
+    return [{ action, ok: r.ok, 数据: r.原始 }]
   }
 
   /** 发图片（每张一条消息）。 */
